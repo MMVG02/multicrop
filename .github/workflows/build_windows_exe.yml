@@ -1,0 +1,47 @@
+name: Build Windows Executable
+
+# Trigger the workflow on pushes to the main branch
+on:
+  push:
+    branches: [ "main" ] # Or your default branch name (e.g., master)
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest # Use a Windows runner
+
+    steps:
+    # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+    - uses: actions/checkout@v4
+
+    # Set up Python 3.9 (adjust version if needed)
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10' # Choose a Python version supported by your code and deps
+
+    # Install dependencies
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller # Install PyInstaller in the runner
+
+    # Build the executable
+    - name: Build executable with PyInstaller
+      run: |
+        pyinstaller --name MultiCropApp `
+                    --onefile `
+                    --windowed `
+                    --icon=app_icon.ico ` # Add this line if you have an icon
+                    multi_crop_app.py
+      # Note: Remove the --icon line if you don't have app_icon.ico
+      # Note: Backtick ` is the line continuation character in PowerShell (used by windows-latest runner)
+
+    # Upload the artifact (the built .exe file)
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: MultiCropApp-Windows # Name of the artifact zip file
+        path: dist/MultiCropApp.exe # Path to the generated executable
