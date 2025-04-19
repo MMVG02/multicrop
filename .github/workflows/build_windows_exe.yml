@@ -30,14 +30,9 @@ jobs:
 
     # Build the executable
     - name: Build executable with PyInstaller
-      run: |
-        pyinstaller --name MultiCropApp `
-                    --onefile `
-                    --windowed `
-                    --icon=app_icon.ico ` # Add this line if you have an icon
-                    multi_crop_app.py
-      # Note: Remove the --icon line if you don't have app_icon.ico
-      # Note: Backtick ` is the line continuation character in PowerShell (used by windows-latest runner)
+      run: pyinstaller --name MultiCropApp --onefile --windowed --icon=app_icon.ico multi_crop_app.py
+      # If you REMOVED the icon line, use this instead:
+      # run: pyinstaller --name MultiCropApp --onefile --windowed multi_crop_app.py
 
     # Upload the artifact (the built .exe file)
     - name: Upload Artifact
