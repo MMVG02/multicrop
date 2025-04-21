@@ -102,7 +102,7 @@ class MultiCropApp(ctk.CTk):
         self.control_frame.grid_propagate(False)
         self.control_frame.grid_columnconfigure(0, weight=1)
         self.control_frame.grid_columnconfigure(1, weight=1)
-        self.control_frame.grid_rowconfigure(3, weight=1) # Listbox row grows -- CHANGED FROM 4 TO 3
+        self.control_frame.grid_rowconfigure(3, weight=1) # Listbox row grows
 
         # Control Buttons
         self.btn_select_image = ctk.CTkButton(self.control_frame, text="Select Image (Ctrl+O)", command=self.handle_open)
@@ -122,16 +122,16 @@ class MultiCropApp(ctk.CTk):
                                     selectbackground='#CDEAFE', selectforeground='black',
                                     highlightthickness=1, highlightbackground="#CCCCCC",
                                     highlightcolor="#89C4F4", borderwidth=0, exportselection=False)
-        self.crop_listbox.grid(row=3, column=0, columnspan=2, padx=10, pady=5, sticky="nsew") # LISTBOX IS NOW ROW 3
+        self.crop_listbox.grid(row=3, column=0, columnspan=2, padx=10, pady=5, sticky="nsew")
         self.crop_listbox.bind("<<ListboxSelect>>", self.on_listbox_select)
         self.crop_listbox.bind("<Double-Button-1>", self.prompt_rename_selected_crop_event)
 
         # Rename/Delete Buttons
         self.btn_rename_crop = ctk.CTkButton(self.control_frame, text="Rename", command=self.prompt_rename_selected_crop, state=tk.DISABLED)
-        self.btn_rename_crop.grid(row=4, column=0, padx=(10, 5), pady=(5, 10), sticky="sew") # BUTTONS NOW ROW 4
+        self.btn_rename_crop.grid(row=4, column=0, padx=(10, 5), pady=(5, 10), sticky="sew")
 
         self.btn_delete_crop = ctk.CTkButton(self.control_frame, text="Delete (Del)", command=self.delete_selected_crop, state=tk.DISABLED, fg_color="#F44336", hover_color="#D32F2F")
-        self.btn_delete_crop.grid(row=4, column=1, padx=(5, 10), pady=(5, 10), sticky="sew") # BUTTONS NOW ROW 4
+        self.btn_delete_crop.grid(row=4, column=1, padx=(5, 10), pady=(5, 10), sticky="sew")
 
         # --- Status Bar ---
         self.status_bar = ctk.CTkFrame(self, height=25, fg_color="gray85")
@@ -309,9 +309,7 @@ class MultiCropApp(ctk.CTk):
     def clear_crops_and_list(self):
         self.canvas.delete("crop_rect"); self.crops.clear(); self.crop_listbox.delete(0,tk.END); self.selected_crop_id=None
         self.btn_delete_crop.configure(state=tk.DISABLED); self.btn_rename_crop.configure(state=tk.DISABLED)
-        # Also disable save buttons when clearing crops
         self.btn_save.configure(state=tk.DISABLED); self.btn_save_as.configure(state=tk.DISABLED)
-
 
     def canvas_to_image_coords(self, cx, cy):
         if not self.original_image or self.zoom_factor<=0: return None,None
@@ -355,8 +353,7 @@ class MultiCropApp(ctk.CTk):
             else: self.selected_crop_id=None;self.btn_delete_crop.configure(state=tk.DISABLED);self.btn_rename_crop.configure(state=tk.DISABLED)
         else: # Deselection
             self.selected_crop_id=None;
-            # CORRECTED INDENTATION HERE:
-            if not from_lb: self.crop_listbox.selection_clear(0,tk.END)
+            if not from_lb: self.crop_listbox.selection_clear(0,tk.END) # Corrected indentation here
             self.btn_delete_crop.configure(state=tk.DISABLED);self.btn_rename_crop.configure(state=tk.DISABLED)
         self.update_status_bar_selection()
 
@@ -373,10 +370,12 @@ class MultiCropApp(ctk.CTk):
     def redraw_all_crops(self):
         aci=self.canvas.find_all()
         for cid,d in self.crops.items():
-            # CORRECTED SYNTAX HERE: Moved 'if' to new line
+            # CORRECTED SYNTAX HERE:
             c=d.get('coords'); rid=d.get('rect_id')
             if not c or len(c)!=4: continue
-            ix1,iy1,ix2,iy2=c;cx1,cy1=self.image_to_canvas_coords(ix1,iy1);cx2,cy2=self.image_to_canvas_coords(ix2,iy2);if cx1 is None:continue
+            # Rest of the assignments and check moved to next line
+            ix1,iy1,ix2,iy2=c; cx1,cy1=self.image_to_canvas_coords(ix1,iy1); cx2,cy2=self.image_to_canvas_coords(ix2,iy2)
+            if cx1 is None: continue # Check moved here
             sel=(cid==self.selected_crop_id);clr=SELECTED_RECT_COLOR if sel else DEFAULT_RECT_COLOR;wid=SELECTED_RECT_WIDTH if sel else RECT_WIDTH;tgs=(RECT_TAG_PREFIX+cid,"crop_rect")
             if rid and rid in aci: self.canvas.coords(rid,cx1,cy1,cx2,cy2);self.canvas.itemconfig(rid,outline=clr,width=wid,tags=tgs)
             else: nrid=self.canvas.create_rectangle(cx1,cy1,cx2,cy2,outline=clr,width=wid,tags=tgs);self.crops[cid]['rect_id']=nrid
