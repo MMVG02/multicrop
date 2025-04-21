@@ -155,8 +155,7 @@ class MultiCropApp(ctk.CTk):
         # Global Keyboard Bindings
         self.bind_all("<Control-o>", self.handle_open_event); self.bind_all("<Control-O>", self.handle_open_event)
         self.bind_all("<Control-s>", self.handle_save_event); self.bind_all("<Control-S>", self.handle_save_event)
-        # *** CORRECTED BINDING FOR DELETE KEY ***
-        self.bind_all("<Delete>", lambda e: self.delete_selected_crop_event(e))
+        self.bind_all("<Delete>", lambda e: self.delete_selected_crop_event(e)) # Corrected
         # Nudge/Resize Bindings
         self.bind_all("<Left>", lambda e: self.handle_nudge(-1, 0)); self.bind_all("<Right>", lambda e: self.handle_nudge(1, 0))
         self.bind_all("<Up>", lambda e: self.handle_nudge(0, -1)); self.bind_all("<Down>", lambda e: self.handle_nudge(0, 1))
@@ -263,8 +262,9 @@ class MultiCropApp(ctk.CTk):
             if self.update_crop_coords(cid,(nx1,ny1,nx2,ny2)): self.redraw_all_crops();self.update_status_bar(action_text="Resized");self.update_status_bar_selection()
 
     def delete_selected_crop_event(self, event=None):
+        # This event handler now correctly receives the event object 'e'
         self.delete_selected_crop()
-        return "break"
+        return "break" # Prevent default delete behavior if any
 
     # --- Image Handling ---
     def select_image(self):
@@ -298,7 +298,7 @@ class MultiCropApp(ctk.CTk):
             self.btn_save.configure(state=tk.DISABLED); self.btn_save_as.configure(state=tk.DISABLED); self.set_dirty(False); self.current_save_dir = None
             self.update_status_bar(action_text="Error Loading")
 
-    # --- Display, Clear, Coord Conversion (Simplified for brevity) ---
+    # --- Display, Clear, Coord Conversion ---
     def display_image_on_canvas(self):
         if not self.original_image: self.canvas.delete("all"); return
         dw,dh = max(1,int(self.original_image.width*self.zoom_factor)), max(1,int(self.original_image.height*self.zoom_factor))
@@ -318,7 +318,7 @@ class MultiCropApp(ctk.CTk):
         if not self.original_image: return None,None
         return (ix*self.zoom_factor)+self.canvas_offset_x, (iy*self.zoom_factor)+self.canvas_offset_y
 
-    # --- Crop Handling (Simplified for brevity, logic unchanged) ---
+    # --- Crop Handling ---
     def add_crop(self, x1i, y1i, x2i, y2i):
         if not self.original_image: return
         iw,ih=self.original_image.size; x1i,y1i=max(0,min(x1i,iw)),max(0,min(y1i,ih)); x2i,y2i=max(0,min(x2i,iw)),max(0,min(y2i,ih))
@@ -351,9 +351,11 @@ class MultiCropApp(ctk.CTk):
                          if self.crop_listbox.get(i)==d.get('name'): idx=i;break
                      if idx!=-1: self.crop_listbox.selection_clear(0,tk.END);self.crop_listbox.selection_set(idx);self.crop_listbox.activate(idx);self.crop_listbox.see(idx)
             else: self.selected_crop_id=None;self.btn_delete_crop.configure(state=tk.DISABLED);self.btn_rename_crop.configure(state=tk.DISABLED)
-        else: self.selected_crop_id=None;
-              if not from_lb: self.crop_listbox.selection_clear(0,tk.END)
-              self.btn_delete_crop.configure(state=tk.DISABLED);self.btn_rename_crop.configure(state=tk.DISABLED)
+        else: # Deselection
+            self.selected_crop_id=None;
+            # CORRECTED INDENTATION HERE:
+            if not from_lb: self.crop_listbox.selection_clear(0,tk.END)
+            self.btn_delete_crop.configure(state=tk.DISABLED);self.btn_rename_crop.configure(state=tk.DISABLED)
         self.update_status_bar_selection()
 
     def update_crop_coords(self, cid, ncoords):
@@ -415,7 +417,7 @@ class MultiCropApp(ctk.CTk):
         if idx!=-1: self.crop_listbox.delete(idx);self.crop_listbox.insert(idx,nn);self.crop_listbox.selection_set(idx);self.crop_listbox.activate(idx)
         self.set_dirty();self.update_status_bar(action_text="Renamed")
 
-    # --- Mouse Events (Simplified for brevity, logic unchanged) ---
+    # --- Mouse Events ---
     def on_mouse_press(self, e):
         self.canvas.focus_set(); cx,cy=self.canvas.canvasx(e.x),self.canvas.canvasy(e.y); atxt="Ready"
         h=self.get_resize_handle(cx,cy);
@@ -454,7 +456,8 @@ class MultiCropApp(ctk.CTk):
         self.is_drawing,self.is_moving,self.is_resizing=False,False,False;self.resize_handle=None;self.start_x,self.start_y=None,None;self.start_coords_img=None;self.update_cursor(e);
         if not(self.is_drawing and self.current_rect_id is None):self.update_status_bar(action_text="Ready")
 
-    # --- Zoom/Pan (Simplified for brevity, logic unchanged) ---
+
+    # --- Zoom/Pan ---
     def on_mouse_wheel(self, e, direction=None):
         if not self.original_image:return;delta=0;
         if direction:delta=direction;
@@ -470,7 +473,7 @@ class MultiCropApp(ctk.CTk):
         if not self.is_panning or not self.original_image:return;cx,cy=self.canvas.canvasx(e.x),self.canvas.canvasy(e.y);dx,dy=cx-self.pan_start_x,cy-self.pan_start_y;self.canvas_offset_x+=dx;self.canvas_offset_y+=dy;self.canvas.move("all",dx,dy);self.pan_start_x,self.pan_start_y=cx,cy
     def on_pan_release(self, e): self.is_panning=False;self.update_cursor(e);self.update_status_bar(action_text="Ready")
 
-    # --- Listbox Selection (Simplified for brevity, logic unchanged) ---
+    # --- Listbox Selection ---
     def on_listbox_select(self, e=None):
         sel=self.crop_listbox.curselection();sid=None;
         if sel:sidx=sel[0];sname=self.crop_listbox.get(sidx);
@@ -478,7 +481,7 @@ class MultiCropApp(ctk.CTk):
                   if d.get('name')==sname:sid=cid;break
         self.select_crop(sid,from_listbox=True)
 
-    # --- Resizing Helpers & Cursor (Simplified for brevity, logic unchanged) ---
+    # --- Resizing Helpers & Cursor ---
     def get_resize_handle(self, cx, cy):
         if not self.selected_crop_id or self.selected_crop_id not in self.crops:return None
         rid=self.crops[self.selected_crop_id].get('rect_id');if not rid or rid not in self.canvas.find_all():return None
@@ -500,7 +503,7 @@ class MultiCropApp(ctk.CTk):
             h=self.resize_handle;
             if h in('nw','se'):nc="size_nw_se";elif h in('ne','sw'):nc="size_ne_sw";elif h in('n','s'):nc="size_ns";elif h in('e','w'):nc="size_we";
         elif self.is_drawing: nc="crosshair"
-        else: # Hover
+        else: # Hover state
             if e: cx,cy=self.canvas.canvasx(e.x),self.canvas.canvasy(e.y);h=self.get_resize_handle(cx,cy);
                   if h:
                       if h in('nw','se'):nc="size_nw_se";elif h in('ne','sw'):nc="size_ne_sw";elif h in('n','s'):nc="size_ns";elif h in('e','w'):nc="size_we";
