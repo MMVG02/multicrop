@@ -17,12 +17,12 @@ DEFAULT_CROP_NAME_PATTERN = r"^(.*)_Crop_(\d+)$" # Regex to parse default names
 
 # --- Main Application Class ---
 class MultiCropApp(ctk.CTk):
-    def __init__(self): # Corrected from init
+    def __init__(self):
         super().__init__()
 
         # --- Window Setup ---
         self.title("Multi Image Cropper")
-        self.geometry("1100x750") # Slightly larger for new buttons
+        self.geometry("1100x780") # Adjusted height for status bar
 
         ctk.set_appearance_mode("Light")
         ctk.set_default_color_theme("blue")
@@ -56,7 +56,8 @@ class MultiCropApp(ctk.CTk):
         # --- UI Layout ---
         self.grid_columnconfigure(0, weight=3) # Image area
         self.grid_columnconfigure(1, weight=1) # Control panel
-        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)    # Main content row expands
+        self.grid_rowconfigure(1, weight=0)    # Status bar row does not expand
 
         # --- Left Frame (Image Display) ---
         self.image_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -68,7 +69,7 @@ class MultiCropApp(ctk.CTk):
         self.canvas.grid(row=0, column=0, sticky="nsew")
 
         # --- Right Frame (Controls) ---
-        self.control_frame = ctk.CTkFrame(self, width=300) # Increased width slightly
+        self.control_frame = ctk.CTkFrame(self, width=300)
         self.control_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
         self.control_frame.grid_propagate(False)
         self.control_frame.grid_columnconfigure(0, weight=1)
@@ -114,6 +115,14 @@ class MultiCropApp(ctk.CTk):
         self.btn_delete_crop = ctk.CTkButton(self.control_frame, text="Delete Selected", command=self.delete_selected_crops, state=tk.DISABLED, fg_color="#F44336", hover_color="#D32F2F")
         self.btn_delete_crop.grid(row=5, column=0, columnspan=2, padx=10, pady=(5, 10), sticky="ew")
 
+        # --- Status Bar (Zoom Label) ---
+        self.status_bar_frame = ctk.CTkFrame(self, height=25, fg_color="transparent")
+        self.status_bar_frame.grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 5), sticky="ew")
+        self.status_bar_frame.grid_columnconfigure(0, weight=1) # Make label expand if needed
+
+        self.zoom_status_label = ctk.CTkLabel(self.status_bar_frame, text="Zoom: 100%", anchor="w") # Anchor text left
+        self.zoom_status_label.grid(row=0, column=0, padx=5, pady=0, sticky="w")
+
         # --- Canvas Bindings ---
         self.canvas.bind("<ButtonPress-1>", self.on_mouse_press)
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
@@ -128,6 +137,10 @@ class MultiCropApp(ctk.CTk):
         self.canvas.bind("<Motion>", self.update_cursor)
         self.bind("<Delete>", self.delete_selected_crops_event) # Bind Delete key
         self.bind("<Configure>", self.on_window_resize)
+
+        # --- Initial Update ---
+        self.update_zoom_label() # Set initial text correctly
+        self.update_button_states() # Ensure buttons are correct initially
 
     # --- Image Handling ---
     def select_image(self):
@@ -167,6 +180,7 @@ class MultiCropApp(ctk.CTk):
             self.clear_crops_and_list()
             self.display_image_on_canvas()
             self.btn_save_crops.configure(state=tk.DISABLED)
+            self.update_zoom_label() # Update label after setting initial zoom
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open or process image:\n{e}")
@@ -177,6 +191,8 @@ class MultiCropApp(ctk.CTk):
             self.tk_image = None
             self.display_image = None
             self.btn_save_crops.configure(state=tk.DISABLED)
+            self.zoom_factor = 1.0 # Reset zoom factor on error
+            self.update_zoom_label() # Update label on error
             self.update_button_states()
 
 
@@ -529,10 +545,8 @@ class MultiCropApp(ctk.CTk):
         clicked_crop_id = self.find_crop_id_at(canvas_x, canvas_y)
 
         if clicked_crop_id:
-            # If Ctrl/Shift is pressed, modify selection, otherwise replace selection
-            # Note: Tkinter's event state checking can be platform-dependent.
-            # For simplicity, left-click always selects *only* the clicked item for now.
-            # Multi-select is handled via the listbox.
+            # Left-click always selects *only* the clicked item.
+            # Multi-select is handled via the listbox (Ctrl/Shift clicks).
             self.select_crop(clicked_crop_id) # Select only this one
 
             # Start moving if the clicked crop is the *only* selected one
@@ -619,7 +633,6 @@ class MultiCropApp(ctk.CTk):
             nx1, ny1, nx2, ny2 = ox1_img, oy1_img, ox2_img, oy2_img
 
             # Adjust coords based on handle and current mouse pos in image space
-            # Important: Adjust the edge corresponding to the handle based on the *current* mouse position
             if 'n' in self.resize_handle: ny1 = curr_img_y
             if 's' in self.resize_handle: ny2 = curr_img_y
             if 'w' in self.resize_handle: nx1 = curr_img_x
@@ -664,6 +677,11 @@ class MultiCropApp(ctk.CTk):
 
 
     # --- Zoom and Pan Handlers ---
+    def update_zoom_label(self):
+        """Updates the text of the zoom status label."""
+        zoom_percentage = int(self.zoom_factor * 100)
+        self.zoom_status_label.configure(text=f"Zoom: {zoom_percentage}%")
+
     def on_mouse_wheel(self, event, direction=None):
         if not self.original_image: return
 
@@ -690,7 +708,9 @@ class MultiCropApp(ctk.CTk):
         self.zoom_factor = new_zoom
         self.canvas_offset_x = canvas_x - (img_x_before * self.zoom_factor)
         self.canvas_offset_y = canvas_y - (img_y_before * self.zoom_factor)
+
         self.display_image_on_canvas()
+        self.update_zoom_label() # Update label after zoom changes
 
 
     def on_pan_press(self, event):
@@ -763,11 +783,12 @@ class MultiCropApp(ctk.CTk):
 
         # Simple input dialog for new name
         dialog = ctk.CTkInputDialog(text="Enter new name:", title="Rename Crop")
-        new_name = dialog.get_input()
+        new_name = dialog.get_input() # Returns None if cancelled
 
-        if new_name and new_name != old_name:
-            # Optional: Check if new_name already exists
-            name_exists = any(data['name'] == new_name for data in self.crops.values())
+        if new_name and new_name.strip() and new_name != old_name:
+            new_name = new_name.strip() # Remove leading/trailing whitespace
+            # Check if new_name already exists (case-sensitive)
+            name_exists = any(data['name'] == new_name for c_id, data in self.crops.items() if c_id != crop_id_to_rename)
             if name_exists:
                 messagebox.showwarning("Rename Failed", f"The name '{new_name}' is already in use.")
                 return
@@ -843,11 +864,8 @@ class MultiCropApp(ctk.CTk):
             self.canvas.config(cursor="fleur")
             return
         if self.is_drawing or self.is_resizing or self.is_moving:
-            # Let the action handlers manage the cursor during drag
-            # (e.g., fleur for moving, specific size cursors for resizing)
              if self.is_moving: self.canvas.config(cursor="fleur")
-             # Resizing cursors are set implicitly by Tkinter based on handle,
-             # but we can force them if needed. Let's rely on hover logic below.
+             # Resizing cursors are set implicitly by Tkinter based on handle hover
              return
 
         new_cursor = "" # Default arrow
@@ -897,7 +915,9 @@ class MultiCropApp(ctk.CTk):
 
         # Create output folder named after the image, relative to script/executable
         base_name = os.path.splitext(os.path.basename(self.image_path))[0]
-        output_dir = os.path.abspath(base_name) # Absolute path
+        # Place output folder in the *same directory* as the original image
+        image_dir = os.path.dirname(self.image_path)
+        output_dir = os.path.join(image_dir, base_name + "_crops") # Changed folder name slightly
 
         try:
             os.makedirs(output_dir, exist_ok=True)
@@ -937,10 +957,11 @@ class MultiCropApp(ctk.CTk):
 
 
         # Show summary message
+        output_folder_display_name = os.path.basename(output_dir) # Get just the folder name for the message
         if error_count == 0:
-            messagebox.showinfo("Success", f"Successfully saved {saved_count} crops to the '{base_name}' folder.")
+            messagebox.showinfo("Success", f"Successfully saved {saved_count} crops to the '{output_folder_display_name}' folder (in the same directory as the original image).")
         else:
-            messagebox.showwarning("Partial Success", f"Saved {saved_count} crops to '{base_name}'.\nFailed to save {error_count} crops (check console/log).")
+            messagebox.showwarning("Partial Success", f"Saved {saved_count} crops to '{output_folder_display_name}'.\nFailed to save {error_count} crops (check console/log).")
 
 
 # --- Run the Application ---
