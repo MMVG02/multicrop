@@ -1,898 +1,20 @@
-# -*- coding: utf-8 -*-
-"""
-Multi Crop App Refactored
-A simple Windows application to select multiple rectangular regions (crops)
-from an image and export them simultaneously.
-
-Refactoring Improvements:
-- Uses a dedicated Crop dataclass.
-- Separates Canvas interaction logic into a helper class.
-- Manages crop data and listbox updates within a CropManager class.
-- Centralizes coordinate conversion.
-- Improves readability of mouse event handlers and save logic.
-- Better state management for drawing/moving/resizing.
-"""
-
 import tkinter as tk
-from tkinter import filedialog, messagebox, Listbox
+from tkinter import filedialog, messagebox, Listbox, simpledialog
 import customtkinter as ctk
 from PIL import Image, ImageTk
 import os
 import uuid
 import math
-import re
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, Any
+import sys
+import re # Import regex
 
 # --- Constants ---
 RECT_TAG_PREFIX = "crop_rect_"
-TEMP_RECT_TAG = "temp_rect"
-IMAGE_TAG = "image"
-CROP_RECT_COMMON_TAG = "crop_rect" # Tag used for all crop rectangles
 DEFAULT_RECT_COLOR = "red"
 SELECTED_RECT_COLOR = "blue"
 RECT_WIDTH = 2
-SELECTED_RECT_WIDTH = 3 # Make selected rectangle thicker
-MIN_CROP_SIZE = 10 # Minimum width/height for a crop in image pixels (in original image pixels)
-APP_NAME = "Multi Image Cropper"
-HANDLE_SIZE = 8 # Size of the resize handles on the canvas
-
-# --- Data Structures ---
-@dataclass
-class Crop:
-    """Represents a single crop area."""
-    id: str # Unique identifier
-    coords: Tuple[int, int, int, int] # (x1, y1, x2, y2) in original image pixels
-    name: str
-    order: int # Sequential number for default naming
-    rect_id: Optional[int] = None # Canvas item ID for the rectangle
-
-# --- Helper Classes ---
-
-class CoordinateConverter:
-    """Handles conversion between canvas and image coordinates, considering zoom and pan."""
-    def __init__(self):
-        self.image_size: Tuple[int, int] = (0, 0) # (width, height)
-        self.zoom_factor: float = 1.0
-        self.canvas_offset_x: float = 0.0
-        self.canvas_offset_y: float = 0.0
-
-    def set_image_data(self, img_width: int, img_height: int):
-        """Set the original image dimensions."""
-        self.image_size = (img_width, img_height)
-
-    def set_zoom_pan(self, zoom_factor: float, offset_x: float, offset_y: float):
-        """Set the current zoom level and canvas pan offset."""
-        self.zoom_factor = zoom_factor
-        self.canvas_offset_x = offset_x
-        self.canvas_offset_y = offset_y
-
-    def canvas_to_image(self, cx: float, cy: float) -> Optional[Tuple[float, float]]:
-        """Convert canvas coordinates to original image coordinates."""
-        if self.zoom_factor <= 0 or self.image_size[0] <= 0 or self.image_size[1] <= 0:
-            return None
-        ix = (cx - self.canvas_offset_x) / self.zoom_factor
-        iy = (cy - self.canvas_offset_y) / self.zoom_factor
-        return ix, iy
-
-    def image_to_canvas(self, ix: float, iy: float) -> Optional[Tuple[float, float]]:
-        """Convert original image coordinates to canvas coordinates."""
-        if self.image_size[0] <= 0 or self.image_size[1] <= 0:
-             return None
-        cx = (ix * self.zoom_factor) + self.canvas_offset_x
-        cy = (iy * self.zoom_factor) + self.canvas_offset_y
-        return cx, cy
-
-    def image_rect_to_canvas(self, rect_img: Tuple[int, int, int, int]) -> Optional[Tuple[float, float, float, float]]:
-        """Convert image rectangle coordinates to canvas rectangle coordinates."""
-        ix1, iy1, ix2, iy2 = rect_img
-        cx1, cy1 = self.image_to_canvas(ix1, iy1)
-        cx2, cy2 = self.image_to_canvas(ix2, iy2)
-        if cx1 is None or cx2 is None: return None
-        return cx1, cy1, cx2, cy2
-
-    def canvas_rect_to_image(self, rect_canvas: Tuple[float, float, float, float]) -> Optional[Tuple[int, int, int, int]]:
-        """Convert canvas rectangle coordinates to image rectangle coordinates."""
-        cx1, cy1, cx2, cy2 = rect_canvas
-        ix1, iy1 = self.canvas_to_image(cx1, cy1)
-        ix2, iy2 = self.canvas_to_image(cx2, cy2)
-        if ix1 is None or ix2 is None: return None
-        iw, ih = self.image_size
-        # Clamp image coordinates to image bounds
-        ix1 = max(0, min(ix1, iw))
-        iy1 = max(0, min(iy1, ih))
-        ix2 = max(0, min(ix2, iw))
-        iy2 = max(0, min(iy2, ih))
-        # Ensure coords are (min_x, min_y, max_x, max_y)
-        return int(min(ix1, ix2)), int(min(iy1, iy2)), int(max(ix1, ix2)), int(max(iy1, iy2))
-
-    def get_clamped_image_coords(self, ix: float, iy: float) -> Tuple[int, int]:
-        """Get clamped image coordinates within image bounds."""
-        iw, ih = self.image_size
-        clamped_x = max(0, min(int(ix), iw))
-        clamped_y = max(0, min(int(iy), ih))
-        return clamped_x, clamped_y
-
-class CropManager:
-    """Manages the collection of crops and interactions with the listbox."""
-    def __init__(self, canvas: tk.Canvas, coord_converter: CoordinateConverter,
-                 listbox: Listbox, on_crops_changed: callable, on_selection_changed: callable):
-        self.canvas = canvas
-        self.coord_converter = coord_converter
-        self.listbox = listbox
-        self.on_crops_changed = on_crops_changed # Callback for dirty state, save button state etc.
-        self.on_selection_changed = on_selection_changed # Callback for selection dependent UI
-
-        self.crops: Dict[str, Crop] = {} # {crop_id: Crop object}
-        self._selected_crop_id: Optional[str] = None
-        self._next_order_num = 1
-
-        self.listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
-        self.listbox.bind("<Double-Button-1>", lambda e: self.prompt_rename_selected())
-
-    @property
-    def selected_crop_id(self) -> Optional[str]:
-        return self._selected_crop_id
-
-    @selected_crop_id.setter
-    def selected_crop_id(self, cid: Optional[str]):
-        if self._selected_crop_id == cid:
-            # Only trigger selection changed callback if actually selecting a crop that already is selected
-            # (e.g., from canvas click on selected), otherwise let the callback handle it.
-            if cid is not None:
-                 self.on_selection_changed(cid)
-            return
-
-        # Deselect previous
-        if self._selected_crop_id and self._selected_crop_id in self.crops:
-            prev_crop = self.crops[self._selected_crop_id]
-            if prev_crop.rect_id is not None and prev_crop.rect_id in self.canvas.find_withtag(prev_crop.rect_id):
-                 self.canvas.itemconfig(prev_crop.rect_id, outline=DEFAULT_RECT_COLOR, width=RECT_WIDTH)
-
-        self._selected_crop_id = cid
-
-        # Select new
-        if cid and cid in self.crops:
-            crop = self.crops[cid]
-            if crop.rect_id is not None and crop.rect_id in self.canvas.find_withtag(crop.rect_id):
-                self.canvas.itemconfig(crop.rect_id, outline=SELECTED_RECT_COLOR, width=SELECTED_RECT_WIDTH)
-                self.canvas.tag_raise(crop.rect_id)
-                # Update listbox selection if necessary (handled by caller for listbox origin)
-
-        self.on_selection_changed(cid)
-
-    def add_crop(self, x1_img: float, y1_img: float, x2_img: float, y2_img: float):
-        """Adds a new crop based on image coordinates (can be float)."""
-        if self.coord_converter.image_size[0] <= 0: return # No image loaded
-
-        # Clamp and order coordinates
-        ix1, iy1, ix2, iy2 = self.coord_converter.canvas_rect_to_image((x1_img, y1_img, x2_img, y2_img))
-        # Use floating point for check to allow small movements, then convert to int for storage
-        fx1, fy1, fx2, fy2 = min(x1_img, x2_img), min(y1_img, y2_img), max(x1_img, x2_img), max(y1_img, y2_img)
-
-        if (fx2 - fx1) < MIN_CROP_SIZE or (fy2 - fy1) < MIN_CROP_SIZE:
-            print(f"Crop too small: {fx2-fx1}x{fy2-fy1}. Min size: {MIN_CROP_SIZE}") # Debugging
-            return
-
-        crop_id = str(uuid.uuid4())
-        crop_name = f"Crop_{self._next_order_num}"
-        coords_int = (ix1, iy1, ix2, iy2)
-
-        new_crop = Crop(id=crop_id, coords=coords_int, name=crop_name, order=self._next_order_num)
-        self._next_order_num += 1
-        self.crops[crop_id] = new_crop
-
-        # Add to listbox
-        self.listbox.insert(tk.END, crop_name)
-
-        # Create canvas rectangle and update crop object
-        canvas_coords = self.coord_converter.image_rect_to_canvas(coords_int)
-        if canvas_coords:
-            rid = self.canvas.create_rectangle(
-                *canvas_coords,
-                outline=DEFAULT_RECT_COLOR, # Start unselected
-                width=RECT_WIDTH,
-                tags=(RECT_TAG_PREFIX + crop_id, CROP_RECT_COMMON_TAG)
-            )
-            new_crop.rect_id = rid
-
-        # Select the new crop
-        self.select_crop_by_id(crop_id)
-        self.listbox.selection_clear(0, tk.END)
-        idx = self._find_listbox_index_by_id(crop_id)
-        if idx != -1:
-            self.listbox.selection_set(idx)
-            self.listbox.activate(idx)
-            self.listbox.see(idx)
-
-        self.on_crops_changed() # Signal that crops have been added/changed
-
-    def delete_crop(self, crop_id: str):
-        """Deletes a crop by its ID."""
-        if crop_id not in self.crops: return
-
-        crop = self.crops[crop_id]
-        listbox_name = crop.name # Store before deleting from dict
-
-        # Delete from canvas
-        if crop.rect_id is not None and crop.rect_id in self.canvas.find_all():
-            self.canvas.delete(crop.rect_id)
-
-        # Delete from listbox
-        idx = self._find_listbox_index_by_name(listbox_name)
-        if idx != -1:
-            self.listbox.delete(idx)
-
-        # Delete from dictionary
-        del self.crops[crop_id]
-
-        # Deselect if the deleted crop was selected
-        if self.selected_crop_id == crop_id:
-            self.selected_crop_id = None # Uses the setter to handle UI updates
-
-        # Auto-select next item in listbox if any
-        if self.listbox.size() > 0:
-            next_idx = min(idx, self.listbox.size() - 1) if idx != -1 else 0
-            self.listbox.selection_set(next_idx)
-            self.listbox.activate(next_idx)
-            # Trigger listbox select handler to update state/selection
-            self._on_listbox_select()
-        else:
-             # If list is empty, ensure no selection is active
-             self.listbox.selection_clear(0, tk.END)
-             self.select_crop_by_id(None) # Explicitly deselect if list is empty
-
-        self.on_crops_changed() # Signal change
-
-    def update_crop_coords(self, crop_id: str, new_coords_img: Tuple[float, float, float, float]) -> bool:
-        """
-        Updates crop coordinates in image pixels (float) and redraws its rectangle.
-        Returns True if coords changed, False otherwise.
-        Handles clamping to image bounds and minimum size check.
-        """
-        if crop_id not in self.crops or self.coord_converter.image_size[0] <= 0: return False
-
-        # Clamp and order the proposed image coordinates
-        ix1, iy1, ix2, iy2 = self.coord_converter.canvas_rect_to_image(new_coords_img) # Re-use clamping/ordering logic
-
-        # Check min size *after* clamping/ordering
-        if (ix2 - ix1) < MIN_CROP_SIZE or (iy2 - iy1) < MIN_CROP_SIZE:
-            # Optionally revert to last valid coords or prevent update
-            print(f"Proposed update too small: {ix2-ix1}x{iy2-iy1}. Reverting/Preventing.")
-            # For simplicity, we just don't update if it becomes too small during drag
-            # More complex logic might "stick" at the min size or revert.
-            return False
-
-        new_coords_int = (ix1, iy1, ix2, iy2)
-        current_coords = self.crops[crop_id].coords
-
-        if new_coords_int != current_coords:
-            self.crops[crop_id].coords = new_coords_int
-            self.redraw_crop(crop_id)
-            self.on_crops_changed() # Signal change
-            return True
-        return False
-
-    def rename_crop(self, crop_id: str, new_name: str) -> bool:
-        """Renames a crop. Returns True if successful, False if name exists."""
-        if crop_id not in self.crops: return False
-        current_name = self.crops[crop_id].name
-        if current_name == new_name: return False # No change
-
-        # Check for duplicates
-        for cid, crop in self.crops.items():
-            if cid != crop_id and crop.name == new_name:
-                return False # Name already exists
-
-        # Update name
-        self.crops[crop_id].name = new_name
-
-        # Update listbox
-        idx = self._find_listbox_index_by_id(crop_id)
-        if idx != -1:
-            self.listbox.delete(idx)
-            self.listbox.insert(idx, new_name)
-            self.listbox.selection_clear(0, tk.END) # Ensure selection is re-applied correctly
-            self.listbox.selection_set(idx)
-            self.listbox.activate(idx) # Ensure it's visible if needed
-
-        self.on_crops_changed() # Signal change
-        return True
-
-    def redraw_all_crops(self):
-        """Redraws all crop rectangles on the canvas based on current zoom/pan."""
-        if self.coord_converter.image_size[0] <= 0:
-             self.canvas.delete(CROP_RECT_COMMON_TAG) # Clear existing if no image
-             return
-
-        # Get existing rectangle IDs for cleanup
-        existing_rect_ids = set(self.canvas.find_withtag(CROP_RECT_COMMON_TAG))
-        updated_or_new_rect_ids = set()
-
-        for crop_id, crop in self.crops.items():
-            canvas_coords = self.coord_converter.image_rect_to_canvas(crop.coords)
-            if not canvas_coords: continue # Skip if conversion failed
-
-            is_selected = (crop_id == self.selected_crop_id)
-            outline_color = SELECTED_RECT_COLOR if is_selected else DEFAULT_RECT_COLOR
-            line_width = SELECTED_RECT_WIDTH if is_selected else RECT_WIDTH
-            tags = (RECT_TAG_PREFIX + crop_id, CROP_RECT_COMMON_TAG)
-
-            if crop.rect_id is not None and crop.rect_id in self.canvas.find_all(): # Check if ID is still valid on canvas
-                # Update existing rectangle
-                self.canvas.coords(crop.rect_id, *canvas_coords)
-                self.canvas.itemconfig(crop.rect_id, outline=outline_color, width=line_width, tags=tags)
-                updated_or_new_rect_ids.add(crop.rect_id)
-            else:
-                # Create new rectangle
-                new_rect_id = self.canvas.create_rectangle(
-                    *canvas_coords,
-                    outline=outline_color,
-                    width=line_width,
-                    tags=tags
-                )
-                crop.rect_id = new_rect_id
-                updated_or_new_rect_ids.add(new_rect_id)
-
-        # Delete rectangles that no longer exist in self.crops (cleanup)
-        for rect_id in existing_rect_ids - updated_or_new_rect_ids:
-             try: self.canvas.delete(rect_id)
-             except tk.TclError: pass # Handle cases where the ID might already be gone
-
-        # Ensure selected crop is on top
-        if self.selected_crop_id and self.selected_crop_id in self.crops:
-            selected_crop = self.crops[self.selected_crop_id]
-            if selected_crop.rect_id is not None:
-                self.canvas.tag_raise(selected_crop.rect_id)
-
-    def redraw_crop(self, crop_id: str):
-         """Redraws a single crop rectangle."""
-         if crop_id not in self.crops: return
-         crop = self.crops[crop_id]
-         if crop.rect_id is None: return # Nothing to redraw yet
-
-         canvas_coords = self.coord_converter.image_rect_to_canvas(crop.coords)
-         if not canvas_coords: return
-
-         is_selected = (crop_id == self.selected_crop_id)
-         outline_color = SELECTED_RECT_COLOR if is_selected else DEFAULT_RECT_COLOR
-         line_width = SELECTED_RECT_WIDTH if is_selected else RECT_WIDTH
-
-         if crop.rect_id in self.canvas.find_all():
-             self.canvas.coords(crop.rect_id, *canvas_coords)
-             self.canvas.itemconfig(crop.rect_id, outline=outline_color, width=line_width)
-             if is_selected: self.canvas.tag_raise(crop.rect_id)
-
-    def select_crop_by_id(self, crop_id: Optional[str], update_listbox=True):
-        """Selects a crop by its ID. If None, deselects all."""
-        self.selected_crop_id = crop_id # Use setter for UI updates
-
-        if update_listbox:
-            self.listbox.selection_clear(0, tk.END)
-            if crop_id and crop_id in self.crops:
-                idx = self._find_listbox_index_by_id(crop_id)
-                if idx != -1:
-                    self.listbox.selection_set(idx)
-                    self.listbox.activate(idx)
-                    self.listbox.see(idx)
-
-    def _on_listbox_select(self, event=None):
-        """Handles selection changes in the listbox."""
-        selection = self.listbox.curselection()
-        if selection:
-            selected_index = selection[0]
-            selected_name = self.listbox.get(selected_index)
-            # Find crop ID by name (efficient enough for typical number of crops)
-            selected_crop_id = None
-            for cid, crop in self.crops.items():
-                if crop.name == selected_name:
-                    selected_crop_id = cid
-                    break
-            self.select_crop_by_id(selected_crop_id, update_listbox=False) # Avoid recursion
-        else:
-            self.select_crop_by_id(None, update_listbox=False)
-
-    def prompt_rename_selected(self):
-        """Prompts user to rename the currently selected crop."""
-        if not self.selected_crop_id or self.selected_crop_id not in self.crops:
-            messagebox.showwarning("Rename Error", "Please select a crop to rename.", parent=self.canvas.winfo_toplevel())
-            return
-
-        crop_to_rename = self.crops[self.selected_crop_id]
-        current_name = crop_to_rename.name
-
-        dialog = ctk.CTkInputDialog(
-            text=f"New name for '{current_name}':",
-            title="Rename Crop",
-            entry_fg_color="white", # Standard CTk colors are fine
-            entry_text_color="black"
-        )
-        # Position dialog near the window center
-        main_window = self.canvas.winfo_toplevel()
-        dialog.geometry(f"+{main_window.winfo_x()+200}+{main_window.winfo_y()+200}")
-
-        new_name_raw = dialog.get_input()
-
-        if new_name_raw is None or not new_name_raw.strip():
-            # User cancelled or entered empty name
-            # Add a status update callback here maybe?
-            return
-
-        new_name = new_name_raw.strip()
-
-        if not self.rename_crop(self.selected_crop_id, new_name):
-            messagebox.showerror("Rename Error", f"Name '{new_name}' already exists or is invalid.", parent=main_window)
-
-    def clear_all_crops(self):
-        """Clears all crops from memory and canvas."""
-        self.canvas.delete(CROP_RECT_COMMON_TAG)
-        self.crops.clear()
-        self.listbox.delete(0, tk.END)
-        self.selected_crop_id = None # Uses setter
-        self._next_order_num = 1
-        self.on_crops_changed() # Signal change
-
-    def _find_listbox_index_by_id(self, crop_id: str) -> int:
-        """Finds the listbox index for a given crop ID."""
-        if crop_id not in self.crops: return -1
-        target_name = self.crops[crop_id].name
-        return self._find_listbox_index_by_name(target_name)
-
-    def _find_listbox_index_by_name(self, name: str) -> int:
-        """Finds the listbox index for a given crop name."""
-        for i in range(self.listbox.size()):
-            if self.listbox.get(i) == name:
-                return i
-        return -1
-
-    def get_crop_by_canvas_id(self, canvas_id: int) -> Optional[Crop]:
-        """Finds a Crop object given its canvas rectangle ID."""
-        tags = self.canvas.gettags(canvas_id)
-        for tag in tags:
-            if tag.startswith(RECT_TAG_PREFIX):
-                crop_id = tag[len(RECT_TAG_PREFIX):]
-                if crop_id in self.crops:
-                    return self.crops[crop_id]
-        return None
-
-    def get_selected_crop(self) -> Optional[Crop]:
-        """Returns the currently selected Crop object."""
-        if self.selected_crop_id and self.selected_crop_id in self.crops:
-            return self.crops[self.selected_crop_id]
-        return None
-
-    def nudge_selected_crop(self, dx_img: int, dy_img: int):
-        """Nudges the selected crop by the given delta in image pixels."""
-        crop = self.get_selected_crop()
-        if crop:
-            x1, y1, x2, y2 = crop.coords
-            new_coords_img = (x1 + dx_img, y1 + dy_img, x2 + dx_img, y2 + dy_img)
-            if self.update_crop_coords(crop.id, new_coords_img):
-                return True # Coords updated
-        return False
-
-    def resize_selected_crop_key(self, dx_img: int, dy_img: int, handle_dir: str):
-        """Resizes the selected crop based on arrow key input."""
-        crop = self.get_selected_crop()
-        if crop:
-            x1, y1, x2, y2 = crop.coords
-            nx1, ny1, nx2, ny2 = x1, y1, x2, y2
-
-            # Apply deltas based on handle direction
-            if 'n' in handle_dir: ny1 += dy_img # dy_img will be negative for Up
-            if 's' in handle_dir: ny2 += dy_img # dy_img will be positive for Down
-            if 'w' in handle_dir: nx1 += dx_img # dx_img will be negative for Left
-            if 'e' in handle_dir: nx2 += dx_img # dx_img will be positive for Right
-
-            # Create the new coordinate tuple, ensuring min/max order for update_crop_coords
-            new_coords_img = (nx1, ny1, nx2, ny2) # update_crop_coords handles min/max ordering and clamping
-
-            if self.update_crop_coords(crop.id, new_coords_img):
-                return True # Coords updated
-        return False
-
-class CanvasHandler:
-    """Handles mouse interactions on the canvas (drawing, moving, resizing, pan, zoom)."""
-    def __init__(self, canvas: tk.Canvas, coord_converter: CoordinateConverter, crop_manager: CropManager,
-                 on_status_update: callable, on_cursor_update: callable):
-        self.canvas = canvas
-        self.coord_converter = coord_converter
-        self.crop_manager = crop_manager
-        self.on_status_update = on_status_update # Callback for status bar
-        self.on_cursor_update = on_cursor_update # Callback for cursor changes
-
-        # Drawing State
-        self._is_drawing = False
-        self._start_canvas_x: Optional[float] = None
-        self._start_canvas_y: Optional[float] = None
-        self._current_temp_rect_id: Optional[int] = None
-
-        # Moving State
-        self._is_moving = False
-        self._move_offset_x: float = 0.0 # Canvas x offset from mouse to rect corner
-        self._move_offset_y: float = 0.0 # Canvas y offset from mouse to rect corner
-        self._start_coords_img: Optional[Tuple[int, int, int, int]] = None # Original image coords when drag started
-
-        # Resizing State
-        self._is_resizing = False
-        self._resize_handle: Optional[str] = None # e.g., 'nw', 'se', 'n', 's'
-        self._start_canvas_x_resize: Optional[float] = None # Canvas x when resize started
-        self._start_canvas_y_resize: Optional[float] = None # Canvas y when resize started
-        self._start_coords_img_resize: Optional[Tuple[int, int, int, int]] = None # Original image coords when resize started
-
-        # Pan State
-        self._is_panning = False
-        self._pan_start_x: float = 0.0 # Canvas x when pan started
-        self._pan_start_y: float = 0.0 # Canvas y when pan started
-
-        self._bind_events()
-
-    def _bind_events(self):
-        self.canvas.bind("<ButtonPress-1>", self._on_mouse_press_left)
-        self.canvas.bind("<B1-Motion>", self._on_mouse_drag_left)
-        self.canvas.bind("<ButtonRelease-1>", self._on_mouse_release_left)
-        self.canvas.bind("<MouseWheel>", self._on_mouse_wheel) # Windows/macOS
-        self.canvas.bind("<ButtonPress-4>", lambda e: self._on_mouse_wheel(e, 1)) # Linux scroll up
-        self.canvas.bind("<ButtonPress-5>", lambda e: self._on_mouse_wheel(e, -1)) # Linux scroll down
-        self.canvas.bind("<ButtonPress-2>", self._on_pan_press) # Middle button
-        self.canvas.bind("<B2-Motion>", self._on_pan_drag)
-        self.canvas.bind("<ButtonRelease-2>", self._on_pan_release)
-        self.canvas.bind("<Motion>", self._on_mouse_motion)
-        self.canvas.bind("<Enter>", self._on_mouse_motion) # To update cursor on enter
-        self.canvas.bind("<Leave>", self._on_mouse_leave)
-
-    def _on_mouse_press_left(self, event):
-        self.canvas.focus_set() # Allow keyboard shortcuts
-        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-
-        # 1. Check for resize handle click
-        handle = self._get_resize_handle_at(cx, cy)
-        if handle and self.crop_manager.selected_crop_id:
-            self._is_resizing = True
-            self._resize_handle = handle
-            self._start_canvas_x_resize, self._start_canvas_y_resize = cx, cy
-            # Store original image coords at the start of resize
-            selected_crop = self.crop_manager.get_selected_crop()
-            if selected_crop:
-                 self._start_coords_img_resize = selected_crop.coords
-                 self.on_status_update(action_text=f"Resizing ({handle})")
-                 self.on_cursor_update(f"size_{handle}") # Set specific resize cursor
-            return
-
-        # 2. Check for crop click (to select or move)
-        clicked_canvas_item = self.canvas.find_overlapping(cx-1, cy-1, cx+1, cy+1)
-        clicked_crop_id = None
-        # Iterate backwards to prioritize items on top (more recently drawn or raised)
-        for item_id in reversed(clicked_canvas_item):
-            tags = self.canvas.gettags(item_id)
-            if CROP_RECT_COMMON_TAG in tags and tags[0].startswith(RECT_TAG_PREFIX):
-                cid = tags[0][len(RECT_TAG_PREFIX):]
-                if cid in self.crop_manager.crops: # Ensure it's a valid crop ID
-                    clicked_crop_id = cid
-                    break # Found the topmost crop rectangle
-
-        if clicked_crop_id:
-            # Select the clicked crop
-            self.crop_manager.select_crop_by_id(clicked_crop_id)
-            # Start moving it
-            self._is_moving = True
-            rect_coords = self.canvas.coords(self.crop_manager.crops[clicked_crop_id].rect_id)
-            self._move_offset_x, self._move_offset_y = cx - rect_coords[0], cy - rect_coords[1]
-             # Store original image coords at the start of move
-            selected_crop = self.crop_manager.get_selected_crop()
-            if selected_crop:
-                 self._start_coords_img = selected_crop.coords
-                 self.on_status_update(action_text="Moving Crop")
-                 self.on_cursor_update("fleur")
-            return
-
-        # 3. If no handle or crop was clicked, start drawing
-        if self.coord_converter.image_size[0] > 0: # Only draw if an image is loaded
-            self._is_drawing = True
-            self._start_canvas_x, self._start_canvas_y = cx, cy
-            # Deselect any current crop before drawing a new one
-            self.crop_manager.select_crop_by_id(None)
-            # Create a temporary rectangle for visual feedback
-            self._current_temp_rect_id = self.canvas.create_rectangle(
-                cx, cy, cx, cy,
-                outline=SELECTED_RECT_COLOR,
-                width=RECT_WIDTH,
-                dash=(4, 4),
-                tags=(TEMP_RECT_TAG,)
-            )
-            self.on_status_update(action_text="Drawing Crop")
-            self.on_cursor_update("crosshair")
-
-
-    def _on_mouse_drag_left(self, event):
-        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-
-        if self._is_drawing and self._current_temp_rect_id:
-            self.canvas.coords(self._current_temp_rect_id, self._start_canvas_x, self._start_canvas_y, cx, cy)
-        elif self._is_moving and self.crop_manager.selected_crop_id and self._start_coords_img:
-            selected_crop = self.crop_manager.get_selected_crop()
-            if selected_crop:
-                # Calculate intended canvas coordinates based on mouse position and initial offset
-                intended_cx1 = cx - self._move_offset_x
-                intended_cy1 = cy - self._move_offset_y
-
-                # Get dimensions of the crop from the *current* canvas rectangle
-                rect_coords = self.canvas.coords(selected_crop.rect_id)
-                width_c, height_c = rect_coords[2] - rect_coords[0], rect_coords[3] - rect_coords[1]
-
-                # Calculate the *intended* canvas bottom-right corner
-                intended_cx2 = intended_cx1 + width_c
-                intended_cy2 = intended_cy1 + height_c
-
-                # Convert intended canvas coordinates to image coordinates
-                # The update_crop_coords method will handle clamping to image bounds
-                self.crop_manager.update_crop_coords(selected_crop.id, (intended_cx1, intended_cy1, intended_cx2, intended_cy2))
-
-        elif self._is_resizing and self.crop_manager.selected_crop_id and self._resize_handle and self._start_coords_img_resize:
-             selected_crop = self.crop_manager.get_selected_crop()
-             if selected_crop:
-                # Get original image coords from drag start
-                oxi1, oyi1, oxi2, oyi2 = self._start_coords_img_resize
-
-                # Calculate delta in image coordinates based on canvas mouse movement
-                current_img_x, current_img_y = self.coord_converter.canvas_to_image(cx, cy)
-                start_img_x, start_img_y = self.coord_converter.canvas_to_image(self._start_canvas_x_resize, self._start_canvas_y_resize)
-
-                if current_img_x is None or start_img_x is None: return # Conversion failed
-
-                dxi = current_img_x - start_img_x
-                dyi = current_img_y - start_img_y
-
-                # Calculate new image coordinates based on the resize handle
-                nx1, ny1, nx2, ny2 = oxi1, oyi1, oxi2, oyi2
-
-                if 'n' in self._resize_handle: ny1 += dyi
-                if 's' in self._resize_handle: ny2 += dyi
-                if 'w' in self._resize_handle: nx1 += dxi
-                if 'e' in self._resize_handle: nx2 += dxi
-
-                # Update crop coordinates (will handle clamping and min size check)
-                self.crop_manager.update_crop_coords(selected_crop.id, (nx1, ny1, nx2, ny2))
-
-        self._on_mouse_motion(event) # Update cursor/coords during drag
-
-
-    def _on_mouse_release_left(self, event):
-        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-
-        if self._is_drawing and self._start_canvas_x is not None and self._start_canvas_y is not None:
-            # Clean up temporary rectangle
-            if self._current_temp_rect_id in self.canvas.find_withtag(TEMP_RECT_TAG):
-                 self.canvas.delete(self._current_temp_rect_id)
-            self._current_temp_rect_id = None
-
-            # Add the new crop if it's large enough
-            img_x1, img_y1 = self.coord_converter.canvas_to_image(self._start_canvas_x, self._start_canvas_y)
-            img_x2, img_y2 = self.coord_converter.canvas_to_image(cx, cy)
-
-            if img_x1 is not None and img_y1 is not None and img_x2 is not None and img_y2 is not None:
-                 self.crop_manager.add_crop(img_x1, img_y1, img_x2, img_y2) # Handles min size check internally
-            else:
-                 self.on_status_update(action_text="Failed to add crop (coord error)")
-
-
-        # Reset state variables
-        self._is_drawing = False
-        self._is_moving = False
-        self._is_resizing = False
-        self._start_canvas_x = None
-        self._start_canvas_y = None
-        self._start_canvas_x_resize = None
-        self._start_canvas_y_resize = None
-        self._resize_handle = None
-        self._start_coords_img = None
-        self._start_coords_img_resize = None
-
-        self._on_mouse_motion(event) # Update cursor to idle state
-        self.on_status_update(action_text="Ready")
-
-
-    def _on_mouse_wheel(self, event, direction=None):
-        if self.coord_converter.image_size[0] <= 0: return # No image loaded
-
-        # Determine scroll direction
-        delta = 0
-        if direction:
-            delta = direction # For Linux buttons 4, 5
-        elif event.num == 5 or event.delta < 0:
-            delta = -1 # Scroll down
-        elif event.num == 4 or event.delta > 0:
-            delta = 1 # Scroll up
-        else:
-            return # Unknown scroll event
-
-        zoom_increment_factor = 1.1 # Zoom 10% in/out
-        min_zoom, max_zoom = 0.01, 25.0 # Define zoom limits
-
-        # Get mouse position in canvas and image coordinates *before* changing zoom
-        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        img_x_before, img_y_before = self.coord_converter.canvas_to_image(cx, cy)
-
-        if img_x_before is None: return # Cannot perform zoom around a point if coord conversion fails
-
-        # Calculate new zoom factor
-        new_zoom_factor = self.coord_converter.zoom_factor * zoom_increment_factor if delta > 0 else self.coord_converter.zoom_factor / zoom_increment_factor
-        new_zoom_factor = max(min_zoom, min(max_zoom, new_zoom_factor))
-
-        # Prevent tiny changes
-        if abs(new_zoom_factor - self.coord_converter.zoom_factor) < 0.001:
-            return
-
-        # Calculate new canvas offset to keep the point under the cursor stable
-        # canvas_x = (image_x * zoom) + offset_x
-        # offset_x = canvas_x - (image_x * zoom)
-        new_offset_x = cx - (img_x_before * new_zoom_factor)
-        new_offset_y = cy - (img_y_before * new_zoom_factor)
-
-        # Update coordinate converter
-        self.coord_converter.set_zoom_pan(new_zoom_factor, new_offset_x, new_offset_y)
-
-        # Redraw image and all crops with new zoom/pan
-        self._redraw_canvas_content()
-
-        self.on_status_update(
-            action_text=f"Zoom {'In' if delta > 0 else 'Out'}",
-            zoom_text=f"Zoom: {self.coord_converter.zoom_factor:.1%}"
-        )
-
-
-    def _on_pan_press(self, event):
-        if self.coord_converter.image_size[0] <= 0: return # No image loaded
-        self._is_panning = True
-        # Get start position in canvas coordinates
-        self._pan_start_x, self._pan_start_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        self.on_cursor_update("fleur") # Change cursor to indicate panning
-        self.on_status_update(action_text="Panning")
-
-    def _on_pan_drag(self, event):
-        if not self._is_panning or self.coord_converter.image_size[0] <= 0: return
-
-        # Get current position in canvas coordinates
-        current_cx, current_cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-
-        # Calculate displacement
-        dx = current_cx - self._pan_start_x
-        dy = current_cy - self._pan_start_y
-
-        # Update canvas offset
-        new_offset_x = self.coord_converter.canvas_offset_x + dx
-        new_offset_y = self.coord_converter.canvas_offset_y + dy
-        self.coord_converter.set_zoom_pan(self.coord_converter.zoom_factor, new_offset_x, new_offset_y)
-
-        # Move all items on the canvas
-        self.canvas.move("all", dx, dy)
-
-        # Update start position for the next drag event
-        self._pan_start_x, self._pan_start_y = current_cx, current_cy
-
-
-    def _on_pan_release(self, event):
-        self._is_panning = False
-        self._on_mouse_motion(event) # Update cursor to hover state
-        self.on_status_update(action_text="Ready")
-
-    def _on_mouse_motion(self, event):
-        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-
-        # Update status bar coordinates
-        img_x, img_y = self.coord_converter.canvas_to_image(cx, cy)
-        coords_text = " Img Coords: --- "
-        if img_x is not None and img_y is not None:
-             clamped_x, clamped_y = self.coord_converter.get_clamped_image_coords(img_x, img_y)
-             coords_text = f" Img Coords: {clamped_x:>4}, {clamped_y:>4}"
-        self.on_status_update(coords_text=coords_text)
-
-        # Update cursor based on state (drawing, moving, resizing) or hover
-        if self._is_panning: self.on_cursor_update("fleur")
-        elif self._is_moving: self.on_cursor_update("fleur") # Moving uses fleur
-        elif self._is_resizing:
-            # Cursor was set on press, keep it during drag
-            pass # Cursor is already set by _on_mouse_press_left
-        elif self._is_drawing: self.on_cursor_update("crosshair")
-        else: # Idle state, check hover
-            handle = self._get_resize_handle_at(cx, cy)
-            if handle:
-                self.on_cursor_update(f"size_{handle}")
-            else:
-                 # Check if hovering inside the selected crop
-                 selected_crop = self.crop_manager.get_selected_crop()
-                 if selected_crop and selected_crop.rect_id is not None:
-                     rect_coords = self.canvas.coords(selected_crop.rect_id)
-                     if len(rect_coords) == 4: # Ensure coords exist
-                         c1, r1, c2, r2 = rect_coords
-                         # Check if mouse is inside the rectangle (with a small margin)
-                         margin = 1 # Pixels inside the border
-                         if (c1 + margin) < cx < (c2 - margin) and (r1 + margin) < cy < (r2 - margin):
-                             self.on_cursor_update("fleur") # Indicate can move
-                             return # Handled hover inside
-                 # Default cursor if not drawing/moving/resizing and not hovering handle/selected crop
-                 self.on_cursor_update("") # "" means default cursor
-
-
-    def _on_mouse_leave(self, event):
-        self.on_status_update(coords_text=" Img Coords: --- ")
-        if not (self._is_drawing or self._is_moving or self._is_resizing or self._is_panning):
-             self.on_cursor_update("") # Reset cursor
-
-    def _get_resize_handle_at(self, cx: float, cy: float) -> Optional[str]:
-        """Check if mouse is over a resize handle of the selected crop."""
-        crop = self.crop_manager.get_selected_crop()
-        if not crop or crop.rect_id is None: return None
-
-        rect_coords = self.canvas.coords(crop.rect_id)
-        if not rect_coords or len(rect_coords) != 4: return None
-
-        c1, r1, c2, r2 = rect_coords # Canvas coordinates of the crop rectangle
-        m = HANDLE_SIZE / 2.0 # Half of the handle size as margin
-
-        # Check corners
-        if abs(cx - c1) < m and abs(cy - r1) < m: return 'nw'
-        if abs(cx - c2) < m and abs(cy - r1) < m: return 'ne'
-        if abs(cx - c1) < m and abs(cy - r2) < m: return 'sw'
-        if abs(cx - c2) < m and abs(cy - r2) < m: return 'se'
-
-        # Check sides (within the bounds of the side)
-        ib = m # Small margin inside the handle area to prevent handle overlaps
-        if abs(cy - r1) < m and (c1 + ib) < cx < (c2 - ib): return 'n'
-        if abs(cy - r2) < m and (c1 + ib) < cx < (c2 - ib): return 's'
-        if abs(cx - c1) < m and (r1 + ib) < cy < (r2 - ib): return 'w'
-        if abs(cx - c2) < m and (r1 + ib) < cy < (r2 - ib): return 'e'
-
-        return None
-
-    def _redraw_canvas_content(self):
-        """Redraws the image and all crops on the canvas."""
-        canvas_w, canvas_h = self.canvas.winfo_width(), self.canvas.winfo_height()
-        # Use requested size if not yet mapped or size is zero
-        if canvas_w <= 1: canvas_w = self.canvas.winfo_reqwidth()
-        if canvas_h <= 1: canvas_h = self.canvas.winfo_reqheight()
-
-        if self.coord_converter.image_size[0] <= 0:
-             self.canvas.delete("all")
-             self.on_status_update(action_text="Ready (No image)")
-             return
-
-        img_w, img_h = self.coord_converter.image_size
-        display_w = max(1, int(img_w * self.coord_converter.zoom_factor))
-        display_h = max(1, int(img_h * self.coord_converter.zoom_factor))
-
-        try:
-            # Get the original image from the main app (need a reference or pass it)
-            # For simplicity here, let's assume the main app holds the original image
-            # and we need a callback or direct access to it.
-            # A better design might pass the display image generation responsiblity
-            # to the main app or a separate image handler.
-            # Let's add a get_original_image callback/method to the main app
-            original_image = self.canvas.winfo_toplevel().get_original_image()
-            if original_image is None: raise ValueError("Original image not available")
-
-            display_image = original_image.resize((display_w, display_h), Image.Resampling.LANCZOS)
-            self.canvas.tk_image = ImageTk.PhotoImage(display_image) # Keep a reference!
-        except Exception as e:
-            print(f"Error resizing image for display: {e}")
-            self.canvas.delete("all")
-            self.on_status_update(action_text="Display Error")
-            self.canvas.tk_image = None # Clear reference on error
-            return
-
-        # Clear existing content (except temporary items if drawing)
-        # Delete image tag and all crop rectangles
-        self.canvas.delete(IMAGE_TAG)
-        self.canvas.delete(CROP_RECT_COMMON_TAG)
-
-        # Draw the new image
-        img_x0 = int(round(self.coord_converter.canvas_offset_x))
-        img_y0 = int(round(self.coord_converter.canvas_offset_y))
-        self.canvas.create_image(img_x0, img_y0, anchor=tk.NW, image=self.canvas.tk_image, tags=IMAGE_TAG)
-
-        # Redraw all crop rectangles
-        self.crop_manager.redraw_all_crops()
-
+MIN_CROP_SIZE = 10
+RESIZE_HANDLE_MARGIN = 6
 
 # --- Main Application Class ---
 class MultiCropApp(ctk.CTk):
@@ -900,561 +22,1059 @@ class MultiCropApp(ctk.CTk):
         super().__init__()
 
         # --- Window Setup ---
-        self.title(APP_NAME)
-        self.geometry("1100x750") # Initial size
-        self.minsize(800, 600)    # Minimum window size
+        self.title("Multi Image Cropper")
+        self.geometry("1000x700")
         ctk.set_appearance_mode("Light")
         ctk.set_default_color_theme("blue")
 
-        # Apply DPI awareness for Windows
-        try: from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
-        except: pass
-
         # --- State Variables ---
-        self.image_path: Optional[str] = None
-        self._original_image: Optional[Image.Image] = None # PIL Image object
-        self.tk_image: Optional[ImageTk.PhotoImage] = None # Tkinter PhotoImage reference
+        self.image_path = None
+        self.original_image = None
+        self.display_image = None
+        self.tk_image = None
+        self.canvas_image_id = None
 
-        self.current_save_dir: Optional[str] = None # Stores the target dir for the current image session
-        self._is_dirty = False # Track unsaved changes
+        # Crop Data and Order
+        self.crops = {}            # {crop_id: {'coords': (x1,y1,x2,y2), 'name': name, 'rect_id': canvas_rect_id}}
+        self.crop_order = []       # List of crop_ids in the desired user order
+        self.selected_crop_id = None # Currently selected single crop ID for canvas editing
 
-        # --- Core Components ---
-        self.coord_converter = CoordinateConverter()
-        self.crop_manager: Optional[CropManager] = None # Initialized after canvas creation
-        self.canvas_handler: Optional[CanvasHandler] = None # Initialized after canvas creation
+        # Drawing/Editing State
+        self.start_x = None
+        self.start_y = None
+        self.current_rect_id = None # ID of the temporary drawing rectangle
+        self.is_drawing = False
+        self.is_moving = False
+        self.is_resizing = False
+        self.resize_handle = None
+        self.start_coords_img = None # Store image coords when starting move/resize
+        self.start_coords_canvas = None # Store canvas coords when starting move
+
+        # Zoom/Pan State
+        self.zoom_factor = 1.0
+        self.pan_start_x = 0
+        self.pan_start_y = 0
+        self.is_panning = False
+        self.canvas_offset_x = 0
+        self.canvas_offset_y = 0
+
+        # Listbox Drag/Drop State
+        self.is_dragging_listbox = False
+        self.drag_start_index = None
+        self.drag_item_id = None
 
         # --- UI Layout ---
-        self._setup_ui()
-
-        # --- Bindings ---
-        self._bind_global_events()
-
-        # Initial status bar update
-        self._update_status_bar()
-
-    def _setup_ui(self):
-        """Sets up the main application UI layout and widgets."""
-        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=3)
+        self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=0) # Status bar
-
-        # --- Main Content Frame ---
-        self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.main_frame.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
-        self.main_frame.grid_columnconfigure(0, weight=3) # Image area
-        self.main_frame.grid_columnconfigure(1, weight=1) # Control panel
-        self.main_frame.grid_rowconfigure(0, weight=1)
 
         # --- Left Frame (Image Display) ---
-        self.image_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.image_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.image_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
         self.image_frame.grid_rowconfigure(0, weight=1)
         self.image_frame.grid_columnconfigure(0, weight=1)
 
-        # Use raw tk.Canvas for performance/compatibility with PIL PhotoImage
         self.canvas = tk.Canvas(self.image_frame, bg="gray90", highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
 
         # --- Right Frame (Controls) ---
-        self.control_frame = ctk.CTkFrame(self.main_frame, width=280)
-        self.control_frame.grid(row=0, column=1, padx=(0, 10), pady=10, sticky="nsew")
-        self.control_frame.grid_propagate(False) # Prevent frame from resizing based on contents
+        self.control_frame = ctk.CTkFrame(self, width=250)
+        self.control_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
+        self.control_frame.grid_propagate(False)
+        self.control_frame.grid_rowconfigure(3, weight=1)
         self.control_frame.grid_columnconfigure(0, weight=1)
-        self.control_frame.grid_columnconfigure(1, weight=1)
-        self.control_frame.grid_rowconfigure(3, weight=1) # Listbox row grows
 
-        # Control Buttons
-        self.btn_select_image = ctk.CTkButton(self.control_frame, text="Select Image (Ctrl+O)", command=self._handle_open)
-        self.btn_select_image.grid(row=0, column=0, columnspan=2, padx=10, pady=(10, 5), sticky="ew")
+        # Buttons
+        self.btn_select_image = ctk.CTkButton(self.control_frame, text="Select Image", command=self.select_image)
+        self.btn_select_image.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="ew")
 
-        self.btn_save = ctk.CTkButton(self.control_frame, text="Save (Ctrl+S)", command=self._handle_save, state=tk.DISABLED)
-        self.btn_save.grid(row=1, column=0, padx=(10, 5), pady=5, sticky="ew")
+        self.btn_save_crops = ctk.CTkButton(self.control_frame, text="Save All Crops", command=self.save_crops, state=tk.DISABLED)
+        self.btn_save_crops.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
 
-        self.btn_save_as = ctk.CTkButton(self.control_frame, text="Save As...", command=self._handle_save_as, state=tk.DISABLED)
-        self.btn_save_as.grid(row=1, column=1, padx=(5, 10), pady=5, sticky="ew")
+        # Crop List Label
+        self.lbl_crop_list = ctk.CTkLabel(self.control_frame, text="Crop List (Drag to reorder, Double-click to rename):")
+        self.lbl_crop_list.grid(row=2, column=0, padx=10, pady=(10, 0), sticky="w")
 
-        # Crop List Area
-        self.lbl_crop_list = ctk.CTkLabel(self.control_frame, text="Crop List (Double-click to rename):")
-        self.lbl_crop_list.grid(row=2, column=0, columnspan=2, padx=10, pady=(10, 0), sticky="w")
-
-        # Using standard Listbox for better performance with many items
-        self.crop_listbox = Listbox(self.control_frame, bg='white', fg='black',
-                                    selectbackground='#CDEAFE', selectforeground='black',
+        # Crop Listbox
+        self.crop_listbox = Listbox(self.control_frame,
+                                    bg='white', fg='black',
+                                    selectbackground='#CDEAFE',
+                                    selectforeground='black',
                                     highlightthickness=1, highlightbackground="#CCCCCC",
-                                    highlightcolor="#89C4F4", borderwidth=0, exportselection=False)
-        self.crop_listbox.grid(row=3, column=0, columnspan=2, padx=10, pady=5, sticky="nsew")
+                                    highlightcolor="#89C4F4",
+                                    borderwidth=0, exportselection=False,
+                                    selectmode=tk.EXTENDED)
+        self.crop_listbox.grid(row=3, column=0, padx=10, pady=5, sticky="nsew")
 
+        # Bindings for Listbox
+        self.crop_listbox.bind("<<ListboxSelect>>", self.on_listbox_select)
+        self.crop_listbox.bind("<Double-Button-1>", self.on_listbox_double_click)
+        self.crop_listbox.bind("<ButtonPress-1>", self.on_listbox_press)
+        self.crop_listbox.bind("<B1-Motion>", self.on_listbox_drag)
+        self.crop_listbox.bind("<ButtonRelease-1>", self.on_listbox_release)
 
-        # Rename/Delete Buttons
-        self.btn_rename_crop = ctk.CTkButton(self.control_frame, text="Rename", command=lambda: self.crop_manager.prompt_rename_selected() if self.crop_manager else None, state=tk.DISABLED)
-        self.btn_rename_crop.grid(row=4, column=0, padx=(10, 5), pady=(5, 10), sticky="sew")
+        # Delete Button
+        self.btn_delete_crops = ctk.CTkButton(self.control_frame, text="Delete Selected Crops", command=self.delete_selected_crops, state=tk.DISABLED, fg_color="#F44336", hover_color="#D32F2F")
+        self.btn_delete_crops.grid(row=4, column=0, padx=10, pady=(5, 10), sticky="ew")
 
-        self.btn_delete_crop = ctk.CTkButton(self.control_frame, text="Delete (Del)", command=self._delete_selected_crop, state=tk.DISABLED, fg_color="#F44336", hover_color="#D32F2F")
-        self.btn_delete_crop.grid(row=4, column=1, padx=(5, 10), pady=(5, 10), sticky="sew")
-
-        # --- Status Bar ---
-        self.status_bar = ctk.CTkFrame(self, height=25, fg_color="gray85")
-        self.status_bar.grid(row=1, column=0, sticky="ew", padx=0, pady=(0,0))
-        self.status_bar.grid_columnconfigure(0, weight=1); self.status_bar.grid_columnconfigure(1, weight=1); self.status_bar.grid_columnconfigure(2, weight=1)
-
-        self.lbl_status_coords = ctk.CTkLabel(self.status_bar, text=" Img Coords: --- ", text_color="gray30", height=20, anchor="w")
-        self.lbl_status_coords.grid(row=0, column=0, sticky="w", padx=(10, 0))
-        self.lbl_status_action = ctk.CTkLabel(self.status_bar, text="Ready", text_color="gray30", height=20, anchor="center")
-        self.lbl_status_action.grid(row=0, column=1, sticky="ew")
-        self.lbl_status_zoom_select = ctk.CTkLabel(self.status_bar, text="Zoom: 100.0% | Sel: --- ", text_color="gray30", height=20, anchor="e")
-        self.lbl_status_zoom_select.grid(row=0, column=2, sticky="e", padx=(0, 10))
-
-        # Initialize CropManager and CanvasHandler *after* canvas is created
-        self.crop_manager = CropManager(
-            canvas=self.canvas,
-            coord_converter=self.coord_converter,
-            listbox=self.crop_listbox,
-            on_crops_changed=self._on_crops_changed,
-            on_selection_changed=self._on_selection_changed
-        )
-        self.canvas_handler = CanvasHandler(
-            canvas=self.canvas,
-            coord_converter=self.coord_converter,
-            crop_manager=self.crop_manager,
-            on_status_update=self._update_status_bar,
-            on_cursor_update=self._update_canvas_cursor
-        )
-
-    def _bind_global_events(self):
-        """Binds application-wide keyboard shortcuts and window events."""
-        self.bind_all("<Control-o>", self._handle_open_event)
-        self.bind_all("<Control-O>", self._handle_open_event)
-        self.bind_all("<Control-s>", self._handle_save_event)
-        self.bind_all("<Control-S>", self._handle_save_event)
-        self.bind_all("<Delete>", self._handle_delete_event) # Corrected name
-
-        # Nudge/Resize Bindings - Delegate to CropManager via handler for now
-        # Could delegate directly if CropManager handles coords only
-        # Let's have the app handle these, calling CropManager
-        self.bind_all("<Left>", lambda e: self._handle_nudge(-1, 0))
-        self.bind_all("<Right>", lambda e: self._handle_nudge(1, 0))
-        self.bind_all("<Up>", lambda e: self._handle_nudge(0, -1))
-        self.bind_all("<Down>", lambda e: self._handle_nudge(0, 1))
-        self.bind_all("<Shift-Left>", lambda e: self._handle_resize_key(-1, 0, 'w'))
-        self.bind_all("<Shift-Right>", lambda e: self._handle_resize_key(1, 0, 'e'))
-        self.bind_all("<Shift-Up>", lambda e: self._handle_resize_key(0, -1, 'n'))
-        self.bind_all("<Shift-Down>", lambda e: self._handle_resize_key(0, 1, 's'))
-
-
-        # Window Events
-        self.bind("<Configure>", self._on_window_resize)
-        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+        # --- Canvas Bindings ---
+        self.canvas.bind("<ButtonPress-1>", self.on_mouse_press)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_mouse_release)
+        self.canvas.bind("<Double-Button-1>", self.on_canvas_double_click)
+        self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
+        self.canvas.bind("<ButtonPress-4>", lambda e: self.on_mouse_wheel(e, 1)) # Linux scroll up
+        self.canvas.bind("<ButtonPress-5>", lambda e: self.on_mouse_wheel(e, -1)) # Linux scroll down
+        self.canvas.bind("<ButtonPress-2>", self.on_pan_press) # Middle mouse
+        self.canvas.bind("<B2-Motion>", self.on_pan_drag)
+        self.canvas.bind("<ButtonRelease-2>", self.on_pan_release)
+        self.canvas.bind("<Motion>", self.update_cursor)
+        self.bind("<Delete>", self.delete_selected_crops_event)
+        self.canvas.bind("<Configure>", self.on_canvas_configure)
 
     # --- Image Handling ---
-    def _handle_open_event(self, event=None): self._handle_open(); return "break"
-    def _handle_open(self):
-        """Prompts user to select an image file and loads it."""
-        if not self._check_unsaved_changes(): return
-
+    def select_image(self):
         path = filedialog.askopenfilename(
             title="Select Image File",
-            filetypes=[
-                ("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp"),
-                ("All files", "*.*")
-            ],
-            parent=self
+            filetypes=[("Image Files", "*.png *.jpg *.jpeg *.bmp *.gif *.tiff")]
         )
         if not path:
-            self._update_status_bar(action_text="Image Selection Cancelled")
             return
 
-        self._update_status_bar(action_text="Loading..."); self.update_idletasks()
-
         try:
-            img = Image.open(path)
-            # Convert image to modes compatible with Tkinter/saving
-            if img.mode == 'CMYK': img = img.convert('RGB')
-            elif img.mode == 'P': img = img.convert('RGBA') # Preserve transparency if possible, handle saving later
-            elif img.mode == 'LA': img = img.convert('RGBA') # Preserve transparency if possible
+            if self.crops:
+                if messagebox.askyesno("Save Current Work", "You have unsaved crops. Do you want to save them before opening a new image?"):
+                     self.save_crops()
 
             self.image_path = path
-            self._original_image = img
+            self.original_image = Image.open(self.image_path)
 
-            # Calculate initial zoom and pan to fit image
-            canvas_w, canvas_h = self.canvas.winfo_width(), self.canvas.winfo_height()
-            # Use requested size if window isn't fully configured yet
-            if canvas_w <= 1: canvas_w = self.canvas.winfo_reqwidth()
-            if canvas_h <= 1: canvas_h = self.canvas.winfo_reqheight()
+            self.clear_crops_and_list() # Clears all crop data
 
-            img_w, img_h = self._original_image.size
-            if img_w <= 0 or img_h <= 0: raise ValueError("Invalid image dimensions")
+            self.update_idletasks()
+            canvas_width = self.canvas.winfo_width()
+            canvas_height = self.canvas.winfo_height()
 
-            # Calculate zoom factor to fit within canvas bounds, leaving a small margin
+            if canvas_width <= 1 or canvas_height <= 1:
+                 canvas_width = 800
+                 canvas_height = 600
+
+            img_width, img_height = self.original_image.size
+            if img_width == 0 or img_height == 0:
+                 raise ValueError("Image has zero dimension")
+
             padding_factor = 0.98
-            zoom_w = (canvas_w / img_w) if img_w > 0 else 1.0
-            zoom_h = (canvas_h / img_h) if img_h > 0 else 1.0
-            initial_zoom = min(zoom_w, zoom_h, 1.0) * padding_factor # Don't zoom in beyond 100% initially
+            zoom_h = (canvas_width * padding_factor) / img_width
+            zoom_v = (canvas_height * padding_factor) / img_height
+            self.zoom_factor = min(1.0, min(zoom_h, zoom_v))
 
-            display_w = img_w * initial_zoom
-            display_h = img_h * initial_zoom
+            display_w = img_width * self.zoom_factor
+            display_h = img_height * self.zoom_factor
+            self.canvas_offset_x = math.ceil((canvas_width - display_w) / 2)
+            self.canvas_offset_y = math.ceil((canvas_height - display_h) / 2)
 
-            # Calculate initial pan offset to center the image
-            offset_x = (canvas_w - display_w) / 2.0
-            offset_y = (canvas_h - display_h) / 2.0
+            self.display_image_on_canvas()
+            self.btn_save_crops.configure(state=tk.DISABLED)
+            self.btn_delete_crops.configure(state=tk.DISABLED)
 
-            # Update components
-            self.coord_converter.set_image_data(img_w, img_h)
-            self.coord_converter.set_zoom_pan(initial_zoom, offset_x, offset_y)
-            self.crop_manager.clear_all_crops() # Clear previous crops
-            self.current_save_dir = None # Reset save directory
-
-            # Display the image and redraw crops
-            self.canvas_handler._redraw_canvas_content() # Access private method for internal refresh
-
-            # Update UI element states
-            self.btn_save.configure(state=tk.DISABLED) # Enable only after crops are added
-            self.btn_save_as.configure(state=tk.DISABLED) # Enable only after crops are added
-            self.set_dirty(False) # Mark as clean initially
-
-            self._update_status_bar(
-                action_text="Image Loaded",
-                zoom_text=f"Zoom: {self.coord_converter.zoom_factor:.1%}"
-            )
-
-        except FileNotFoundError:
-            messagebox.showerror("Error", f"File not found:\n{path}", parent=self)
-            self._reset_app_state()
-            self._update_status_bar(action_text="Error: File Not Found")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to open or process image:\n{e}", parent=self)
-            self._reset_app_state()
-            self._update_status_bar(action_text="Error Loading Image")
+            messagebox.showerror("Error", f"Failed to open or process image:\n{e}")
+            self.image_path = None
+            self.original_image = None
+            self.clear_crops_and_list()
+            self.canvas.delete("all")
+            self.tk_image = None
+            self.display_image = None
+            self.btn_save_crops.configure(state=tk.DISABLED)
+            self.btn_delete_crops.configure(state=tk.DISABLED)
 
-    def _reset_app_state(self):
-        """Resets the application state when image loading fails or image is cleared."""
-        self.image_path = None
-        self._original_image = None
-        self.tk_image = None
-        self.current_save_dir = None
-        self.set_dirty(False)
-        self.coord_converter.set_image_data(0, 0) # Reset converter
-        self.coord_converter.set_zoom_pan(1.0, 0.0, 0.0) # Reset converter
-        if self.crop_manager: self.crop_manager.clear_all_crops() # Clear crops via manager
-        self.canvas.delete("all") # Clear canvas
-        self.btn_save.configure(state=tk.DISABLED)
-        self.btn_save_as.configure(state=tk.DISABLED)
-        self._update_status_bar() # Reset status bar
+    def clear_crops_and_list(self):
+        """Clears existing crops, listbox, and resets related states."""
+        self.canvas.delete("crop_rect")
+        self.crops.clear()
+        self.crop_order.clear()
+        self.refresh_listbox()
+        self.selected_crop_id = None
+        self.btn_delete_crops.configure(state=tk.DISABLED)
 
-
-    def get_original_image(self) -> Optional[Image.Image]:
-        """Allows CanvasHandler to access the original image."""
-        return self._original_image
-
-    # --- Save Handling ---
-    def _handle_save_event(self, event=None): self._handle_save(); return "break"
-
-    def _handle_save(self):
-        """Saves crops to the last used or default directory."""
-        if not self._check_save_preconditions(): return
-
-        target_dir = self.current_save_dir
-
-        if not target_dir:
-            # Determine default save directory (subfolder next to image)
-            try:
-                if not self.image_path: raise ValueError("Image path not set")
-                img_dir = os.path.dirname(self.image_path)
-                base_name = os.path.splitext(os.path.basename(self.image_path))[0]
-                if not base_name: raise ValueError("Could not determine base name from image path")
-                target_dir = os.path.join(img_dir, base_name)
-
-                # Create directory if it doesn't exist
-                os.makedirs(target_dir, exist_ok=True)
-                self.current_save_dir = target_dir # Store for future saves
-            except Exception as e:
-                messagebox.showerror("Directory Error", f"Could not determine/create default save directory:\n{e}", parent=self)
-                self._update_status_bar(action_text="Save Failed (Dir Error)")
-                return
-
-        # Perform the save operation with sequential naming
-        self._perform_save(target_dir=target_dir, use_sequential_naming=True)
-
-    def _handle_save_as(self):
-        """Prompts user for a directory and saves crops using their names."""
-        if not self._check_save_preconditions(): return
-
-        # Determine initial directory for the dialog
-        initial_dir = self.current_save_dir
-        if not initial_dir and self.image_path:
-            try:
-                # Suggest a subfolder next to the image as a starting point
-                img_dir = os.path.dirname(self.image_path)
-                base_name = os.path.splitext(os.path.basename(self.image_path))[0]
-                if base_name: initial_dir = os.path.join(img_dir, base_name)
-            except: pass # Ignore errors, filedialog will default
-
-        output_dir = filedialog.askdirectory(
-            parent=self,
-            title="Select Folder to Save Cropped Images",
-            initialdir=initial_dir
-        )
-
-        if not output_dir:
-            self._update_status_bar(action_text="Save As Cancelled")
+    def display_image_on_canvas(self):
+        """Displays the current self.display_image on the canvas respecting zoom and pan."""
+        if not self.original_image:
+            self.canvas.delete("all")
             return
 
-        self.current_save_dir = output_dir # Store for future "Save" clicks
+        disp_w = int(self.original_image.width * self.zoom_factor)
+        disp_h = int(self.original_image.height * self.zoom_factor)
 
-        # Perform the save operation using crop names
-        self._perform_save(target_dir=output_dir, use_sequential_naming=False)
+        disp_w = max(1, disp_w)
+        disp_h = max(1, disp_h)
 
-    def _check_save_preconditions(self) -> bool:
-        """Checks if saving is possible (image loaded, crops exist)."""
-        if self._original_image is None or not self.image_path:
-            messagebox.showwarning("Save Error", "No image loaded.", parent=self)
-            return False
-        if not self.crop_manager or not self.crop_manager.crops:
-            messagebox.showwarning("Save Error", "No crops defined.", parent=self)
-            return False
-        return True
-
-    def _perform_save(self, target_dir: str, use_sequential_naming: bool):
-        """Core logic for saving crops to a specified directory."""
-        self._update_status_bar(action_text="Saving..."); self.update_idletasks() # Update UI immediately
-
-        saved_count, error_count = 0, 0
-        error_messages = []
-
-        # Sort crops by their original order number for sequential naming compatibility
-        # Even when using names, saving in original order might be preferred
-        sorted_crops_items = sorted(self.crop_manager.crops.items(), key=lambda item: item[1].order)
-
-        base_img_name = ""
-        if self.image_path:
-            base_img_name = os.path.splitext(os.path.basename(self.image_path))[0]
-
-        for i, (crop_id, crop) in enumerate(sorted_crops_items):
-            coords = crop.coords
-            crop_name = crop.name
-
-            if not coords or len(coords) != 4:
-                error_count += 1
-                error_messages.append(f"Skip '{crop_name}': Invalid coordinates")
-                continue
-
-            # Determine filename
-            if use_sequential_naming:
-                # Use the index in the sorted list (0-based) + 1
-                filename = f"{base_img_name}_{i + 1}.jpg"
-            else:
-                # Sanitize crop name for use in filename
-                sanitized_name = re.sub(r'[\\/*?:"<>|]', '_', crop_name).strip()
-                # Ensure filename is not empty after sanitizing, use order number if needed
-                if not sanitized_name:
-                    sanitized_name = f"Crop_{crop.order}" # Fallback to order number
-                filename = f"{sanitized_name}.jpg"
-
-            file_path = os.path.join(target_dir, filename)
-            image_crop_coords = tuple(map(int, coords)) # Ensure integer coordinates for PIL
-
-            try:
-                # Use the original image for cropping
-                cropped_image = self._original_image.crop(image_crop_coords)
-
-                # Convert image to RGB if needed for JPEG save
-                # Handle transparency: blend with white background for JPEG
-                if cropped_image.mode in ('RGBA', 'P', 'LA'):
-                    background = Image.new("RGB", cropped_image.size, (255, 255, 255))
-                    # Use the alpha channel as mask if available
-                    alpha_mask = cropped_image.split()[-1] if 'A' in cropped_image.mode else None
-                    background.paste(cropped_image, mask=alpha_mask)
-                    cropped_image = background
-                elif cropped_image.mode != 'RGB':
-                     cropped_image = cropped_image.convert('RGB')
-
-                cropped_image.save(file_path, "JPEG", quality=95, optimize=True)
-                saved_count += 1
-
-            except Exception as e:
-                error_count += 1
-                error_msg = f"Error saving '{filename}': {e}"
-                print(error_msg) # Log error
-                error_messages.append(error_msg)
-
-        if error_count == 0:
-            self.set_dirty(False) # Mark as clean if all saved successfully
-            messagebox.showinfo("Save Successful", f"Successfully saved {saved_count} crops to:\n{target_dir}", parent=self)
-            self._update_status_bar(action_text="Saved OK")
-        else:
-            # Truncate error messages for the dialog box
-            error_summary = "\n - ".join(error_messages[:5])
-            if len(error_messages) > 5:
-                error_summary += "\n - (...more errors not shown)"
-            messagebox.showwarning(
-                "Save Completed with Errors",
-                f"Saved {saved_count} crops. Failed to save {error_count} crops to:\n{target_dir}\n\nErrors:\n - {error_summary}",
-                parent=self
-            )
-            self._update_status_bar(action_text="Saved (with errors)")
-
-
-    # --- Unsaved Changes Handling ---
-    def set_dirty(self, dirty_state: bool = True):
-        """Sets the dirty state and updates the window title."""
-        if self._is_dirty != dirty_state:
-            self._is_dirty = dirty_state
-            title = APP_NAME
-            if self._is_dirty: title += " *"
-            self.title(title)
-
-    def _check_unsaved_changes(self) -> bool:
-        """Checks if there are unsaved changes and prompts the user. Returns True if OK to proceed, False otherwise."""
-        if not self._is_dirty: return True # No changes, safe to proceed
-        response = messagebox.askyesnocancel(
-            "Unsaved Changes",
-            "You have unsaved crops. Do you want to save before proceeding?",
-            icon=messagebox.WARNING,
-            parent=self
-        )
-        if response is True:
-            self._handle_save()
-            # Check dirty state again after save attempt
-            return not self._is_dirty
-        elif response is False:
-            # User chose to discard changes
-            return True
-        else:
-            # User chose to cancel
-            return False
-
-    def _on_closing(self):
-        """Handles window closing event, checks for unsaved changes."""
-        if self._check_unsaved_changes():
-            self.destroy()
-
-    # --- Status Bar & UI Updates ---
-    def _update_status_bar(self, action_text: Optional[str] = None, coords_text: Optional[str] = None,
-                           zoom_text: Optional[str] = None, selection_text: Optional[str] = None):
-        """Updates parts of the status bar."""
-        # Get current texts to update only specified parts
-        current_action = self.lbl_status_action.cget("text")
-        current_coords = self.lbl_status_coords.cget("text")
-        current_zoom_select = self.lbl_status_zoom_select.cget("text")
-
-        # Split zoom and selection parts
-        parts = current_zoom_select.split('|', 1)
-        current_zoom_info = parts[0].strip() if parts else f"Zoom: {self.coord_converter.zoom_factor:.1%}"
-        current_select_info = parts[1].strip() if len(parts) > 1 else "Sel: ---"
-
-
-        new_action = action_text if action_text is not None else current_action
-        new_coords = coords_text if coords_text is not None else current_coords
-        new_zoom_info = zoom_text if zoom_text is not None else current_zoom_info
-        new_select_info = selection_text if selection_text is not None else current_select_info
-
-        self.lbl_status_action.configure(text=new_action)
-        self.lbl_status_coords.configure(text=new_coords)
-        self.lbl_status_zoom_select.configure(text=f"{new_zoom_info} | {new_select_info}")
-
-
-    def _update_status_bar_selection_info(self):
-        """Updates the selection part of the status bar."""
-        selection_text = " Sel: --- "
-        selected_crop = self.crop_manager.get_selected_crop()
-        if selected_crop:
-            coords = selected_crop.coords
-            if coords and len(coords) == 4:
-                # Calculate width and height in image pixels
-                width = coords[2] - coords[0]
-                height = coords[3] - coords[1]
-                selection_text = f" Sel: {max(0, width)}x{max(0, height)} px" # Show non-negative size
-        self._update_status_bar(selection_text=selection_text)
-
-
-    def _update_canvas_cursor(self, cursor_style: str):
-        """Sets the canvas cursor style."""
         try:
-            self.canvas.config(cursor=cursor_style)
-        except tk.TclError:
-            # Fallback for potentially unsupported cursors
-            print(f"Warning: Cursor style '{cursor_style}' might not be supported. Using default.")
-            self.canvas.config(cursor="")
+            self.display_image = self.original_image.resize((disp_w, disp_h), Image.Resampling.LANCZOS)
+        except Exception as e:
+             print(f"Error resizing image: {e}")
+             self.display_image = None
+             self.canvas.delete("all")
+             return
+
+        self.tk_image = ImageTk.PhotoImage(self.display_image)
+
+        self.canvas.delete("image")
+        self.canvas.delete("crop_rect")
+
+        int_offset_x = int(round(self.canvas_offset_x))
+        int_offset_y = int(round(self.canvas_offset_y))
+
+        self.canvas_image_id = self.canvas.create_image(
+            int_offset_x, int_offset_y,
+            anchor=tk.NW, image=self.tk_image, tags="image"
+        )
+
+        self.redraw_all_crops()
+
+    # --- Coordinate Conversion ---
+    def canvas_to_image_coords(self, canvas_x, canvas_y):
+        """Convert canvas coordinates to original image coordinates."""
+        if not self.original_image or self.zoom_factor == 0: return None, None
+        img_x = (canvas_x - self.canvas_offset_x) / self.zoom_factor
+        img_y = (canvas_y - self.canvas_offset_y) / self.zoom_factor
+
+        img_width, img_height = self.original_image.size
+        img_x = max(0, min(img_x, img_width))
+        img_y = max(0, min(img_y, img_height))
+
+        return img_x, img_y
+
+    def image_to_canvas_coords(self, img_x, img_y):
+        """Convert original image coordinates to canvas coordinates."""
+        if not self.original_image: return None, None
+        canvas_x = (img_x * self.zoom_factor) + self.canvas_offset_x
+        canvas_y = (img_y * self.zoom_factor) + self.canvas_offset_y
+        return canvas_x, canvas_y
+
+    # --- Crop Handling ---
+    def find_next_default_crop_number(self):
+        """Finds the smallest positive integer not currently used in default crop names."""
+        used_numbers = set()
+        # Regex to find a number at the end, optionally preceded by common separators and 'crop'
+        # More robust: look for a number at the end preceded by non-digits
+        # Simple version: look for '_number' or 'number' at the end
+        pattern = re.compile(r'_?(\d+)$') # Matches _123 or 123 at the end
+
+        for crop_data in self.crops.values():
+            name = crop_data['name']
+            match = pattern.search(name)
+            if match:
+                try:
+                    number = int(match.group(1))
+                    used_numbers.add(number)
+                except ValueError:
+                    pass # Ignore names that look like they end in a number but aren't parseable
+
+        n = 1
+        while n in used_numbers:
+            n += 1
+        return n
 
 
-    def _on_crops_changed(self):
-        """Callback from CropManager when crops are added, deleted, or modified."""
-        self.set_dirty(True)
-        # Update save button states based on whether there are crops
-        has_crops = bool(self.crop_manager.crops)
-        self.btn_save.configure(state=tk.NORMAL if has_crops else tk.DISABLED)
-        self.btn_save_as.configure(state=tk.NORMAL if has_crops else tk.DISABLED)
+    def add_crop(self, x1_img, y1_img, x2_img, y2_img):
+        """Adds a new crop definition, adds it to the order, and redraws."""
+        if not self.original_image: return
+
+        img_w, img_h = self.original_image.size
+
+        x1_img = max(0.0, min(x1_img, img_w))
+        y1_img = max(0.0, min(y1_img, img_h))
+        x2_img = max(0.0, min(x2_img, img_w))
+        y2_img = max(0.0, min(y2_img, img_h))
+
+        final_x1 = min(x1_img, x2_img)
+        final_y1 = min(y1_img, y2_img)
+        final_x2 = max(x1_img, x2_img)
+        final_y2 = max(y1_img, y2_img)
+
+        if (final_x2 - final_x1) < MIN_CROP_SIZE or (final_y2 - final_y1) < MIN_CROP_SIZE:
+            return
+
+        coords = (final_x1, final_y1, final_x2, final_y2)
+
+        crop_id = str(uuid.uuid4())
+        base_name = os.path.splitext(os.path.basename(self.image_path))[0] if self.image_path else "Image"
+
+        # Use the calculated next available number for the default name
+        next_num = self.find_next_default_crop_number()
+        crop_name = f"{base_name}_Crop_{next_num}"
+
+        cx1, cy1 = self.image_to_canvas_coords(coords[0], coords[1])
+        cx2, cy2 = self.image_to_canvas_coords(coords[2], coords[3])
+
+        if cx1 is None:
+             print("Error: Cannot add crop, coordinate conversion failed.")
+             return
+
+        rect_id = self.canvas.create_rectangle(
+            cx1, cy1, cx2, cy2,
+            outline=DEFAULT_RECT_COLOR, width=RECT_WIDTH,
+            tags=(RECT_TAG_PREFIX + crop_id, "crop_rect")
+        )
+
+        self.crops[crop_id] = {
+            'coords': coords,
+            'name': crop_name,
+            'rect_id': rect_id
+        }
+        self.crop_order.append(crop_id)
+
+        self.refresh_listbox()
+        new_index = len(self.crop_order) - 1
+        if new_index >= 0:
+            self.crop_listbox.selection_clear(0, tk.END)
+            self.crop_listbox.selection_set(new_index)
+            self.crop_listbox.activate(new_index)
+            self.crop_listbox.see(new_index)
+            self.select_crop(crop_id, from_listbox=False)
+
+        self.btn_save_crops.configure(state=tk.NORMAL)
+        # Delete button state handled by on_listbox_select
+
+    def select_crop(self, crop_id, from_listbox=False):
+        """Selects a crop by its ID, updates visuals on canvas."""
+        if self.selected_crop_id and self.selected_crop_id in self.crops:
+             prev_rect_id = self.crops[self.selected_crop_id]['rect_id']
+             if self.canvas.find_withtag(prev_rect_id):
+                  self.canvas.itemconfig(prev_rect_id, outline=DEFAULT_RECT_COLOR)
+
+        self.selected_crop_id = crop_id
+
+        if crop_id and crop_id in self.crops:
+            rect_id = self.crops[crop_id]['rect_id']
+            if self.canvas.find_withtag(rect_id):
+                 self.canvas.itemconfig(rect_id, outline=SELECTED_RECT_COLOR)
+                 self.canvas.tag_raise(rect_id)
+
+                 if not from_listbox:
+                      try:
+                          index = self.crop_order.index(crop_id)
+                          self.crop_listbox.selection_clear(0, tk.END)
+                          self.crop_listbox.selection_set(index)
+                          self.crop_listbox.activate(index)
+                          self.crop_listbox.see(index)
+                      except ValueError:
+                           print(f"Error: crop_id {crop_id} not found in crop_order.")
+                           self.crop_listbox.selection_clear(0, tk.END)
+                           self.selected_crop_id = None
+
+            else:
+                 print(f"Warning: Stale rectangle ID {rect_id} for crop {crop_id}")
+                 if crop_id in self.crops:
+                      del self.crops[crop_id]
+                 if crop_id in self.crop_order:
+                      self.crop_order.remove(crop_id)
+                 self.refresh_listbox()
+                 self.selected_crop_id = None
+
+        else:
+            self.selected_crop_id = None
+            if not from_listbox:
+                 self.crop_listbox.selection_clear(0, tk.END)
+
+    def update_crop_coords(self, crop_id, new_img_coords):
+        """Updates the stored original image coordinates for a crop."""
+        if crop_id in self.crops and self.original_image:
+             img_w, img_h = self.original_image.size
+             x1, y1, x2, y2 = new_img_coords
+
+             x1 = max(0.0, min(x1, img_w))
+             y1 = max(0.0, min(y1, img_h))
+             x2 = max(0.0, min(x2, img_w))
+             y2 = max(0.0, min(y2, img_h))
+
+             sorted_x1, sorted_x2 = sorted((x1, x2))
+             sorted_y1, sorted_y2 = sorted((y1, y2))
+
+             if (sorted_x2 - sorted_x1) < MIN_CROP_SIZE or (sorted_y2 - sorted_y1) < MIN_CROP_SIZE:
+                 return False
+
+             self.crops[crop_id]['coords'] = (sorted_x1, sorted_y1, sorted_x2, sorted_y2)
+             return True
+        return False
+
+    def redraw_all_crops(self):
+        """Redraws all rectangles based on stored coords and current view."""
+        self.canvas.delete("crop_rect")
+
+        for crop_id in self.crop_order:
+            if crop_id in self.crops:
+                 data = self.crops[crop_id]
+                 img_x1, img_y1, img_x2, img_y2 = data['coords']
+
+                 cx1, cy1 = self.image_to_canvas_coords(img_x1, img_y1)
+                 cx2, cy2 = self.image_to_canvas_coords(img_x2, img_y2)
+
+                 if cx1 is None: continue
+
+                 color = SELECTED_RECT_COLOR if crop_id == self.selected_crop_id else DEFAULT_RECT_COLOR
+                 tags_tuple = (RECT_TAG_PREFIX + crop_id, "crop_rect")
+
+                 rect_id = self.canvas.create_rectangle(
+                      cx1, cy1, cx2, cy2,
+                      outline=color, width=RECT_WIDTH,
+                      tags=tags_tuple
+                 )
+                 self.crops[crop_id]['rect_id'] = rect_id
+
+        if self.selected_crop_id and self.selected_crop_id in self.crops:
+            selected_rect_id = self.crops[self.selected_crop_id]['rect_id']
+            if self.canvas.find_withtag(selected_rect_id):
+                 self.canvas.tag_raise(selected_rect_id)
+
+    def refresh_listbox(self):
+        """Clears the listbox and repopulates it based on self.crop_order."""
+        self.crop_listbox.delete(0, tk.END)
+        for crop_id in self.crop_order:
+            if crop_id in self.crops:
+                self.crop_listbox.insert(tk.END, self.crops[crop_id]['name'])
+            else:
+                print(f"Warning: crop_id {crop_id} found in crop_order but not in crops dictionary!")
+
+        self.select_crop(None, from_listbox=False) # Deselect canvas selection
+
+    def delete_selected_crops_event(self, event=None):
+        """Handles delete key press."""
+        self.delete_selected_crops()
+
+    def delete_selected_crops(self):
+        """Deletes the currently selected crops from the listbox."""
+        selected_indices = list(self.crop_listbox.curselection())
+        if not selected_indices:
+            return
+
+        crop_ids_to_delete = [self.crop_order[i] for i in selected_indices if i < len(self.crop_order)]
+
+        if not crop_ids_to_delete:
+             print("Warning: No valid crops found for deletion based on listbox selection.")
+             return
+
+        if len(crop_ids_to_delete) > 1:
+            if not messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete {len(crop_ids_to_delete)} selected crops?"):
+                return
+
+        # Iterate in reverse order of index to avoid index issues when removing from crop_order list
+        for index in sorted(selected_indices, reverse=True):
+            if index < len(self.crop_order):
+                crop_id = self.crop_order[index]
+                if crop_id in self.crops:
+                    data = self.crops[crop_id]
+                    if self.canvas.find_withtag(data['rect_id']):
+                        self.canvas.delete(data['rect_id'])
+                    del self.crops[crop_id]
+                del self.crop_order[index]
+
+        self.refresh_listbox()
+        self.selected_crop_id = None
+        self.crop_listbox.selection_clear(0, tk.END)
+        self.btn_delete_crops.configure(state=tk.DISABLED)
+
+        if not self.crops:
+             self.btn_save_crops.configure(state=tk.DISABLED)
+
+    # --- Mouse Event Handlers (Canvas) ---
+    def on_mouse_press(self, event):
+        self.canvas.focus_set()
+        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+
+        if self.selected_crop_id:
+            handle = self.get_resize_handle(canvas_x, canvas_y)
+            if handle:
+                self.is_resizing = True
+                self.resize_handle = handle
+                self.start_x = canvas_x
+                self.start_y = canvas_y
+                self.start_coords_img = self.crops[self.selected_crop_id]['coords']
+                self.canvas.config(cursor=self.get_handle_cursor(handle))
+                return
+
+        if self.selected_crop_id:
+             rect_id = self.crops[self.selected_crop_id]['rect_id']
+             if self.canvas.find_withtag(rect_id):
+                  cx1, cy1, cx2, cy2 = self.canvas.coords(rect_id)
+                  if cx1 <= canvas_x <= cx2 and cy1 <= canvas_y <= cy2:
+                       self.is_moving = True
+                       self.start_x = canvas_x
+                       self.start_y = canvas_y
+                       self.start_coords_canvas = self.canvas.coords(rect_id)
+                       self.canvas.config(cursor="fleur")
+                       return
+
+        tolerance = 3
+        items = self.canvas.find_overlapping(canvas_x - tolerance, canvas_y - tolerance, canvas_x + tolerance, canvas_y + tolerance)
+
+        clicked_crop_id = None
+        for item_id in reversed(items):
+            tags = self.canvas.gettags(item_id)
+            for tag in tags:
+                if tag.startswith(RECT_TAG_PREFIX):
+                    crop_id = tag[len(RECT_TAG_PREFIX):]
+                    if crop_id in self.crops:
+                         cx1, cy1, cx2, cy2 = self.canvas.coords(item_id)
+                         if (cx1 <= canvas_x <= cx2 and cy1 <= canvas_y <= cy2) or \
+                            (abs(canvas_x - cx1) <= tolerance) or (abs(canvas_x - cx2) <= tolerance) or \
+                            (abs(canvas_y - cy1) <= tolerance) or (abs(canvas_y - cy2) <= tolerance) :
+                              clicked_crop_id = crop_id
+                              break
+            if clicked_crop_id:
+                 break
+
+        if clicked_crop_id:
+            self.select_crop(clicked_crop_id)
+            return
+
+        if self.original_image:
+             self.is_drawing = True
+             self.start_x = canvas_x
+             self.start_y = canvas_y
+             self.select_crop(None)
+             self.current_rect_id = self.canvas.create_rectangle(
+                 self.start_x, self.start_y, self.start_x, self.start_y,
+                 outline=SELECTED_RECT_COLOR, width=RECT_WIDTH, dash=(4, 4),
+                 tags=("temp_rect",)
+             )
+
+    def on_canvas_double_click(self, event):
+        """Handle double-click on canvas - primarily for selecting a rectangle."""
+        self.canvas.focus_set()
+        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+
+        tolerance = 3
+        items = self.canvas.find_overlapping(canvas_x - tolerance, canvas_y - tolerance, canvas_x + tolerance, canvas_y + tolerance)
+
+        clicked_crop_id = None
+        for item_id in reversed(items):
+            tags = self.canvas.gettags(item_id)
+            for tag in tags:
+                if tag.startswith(RECT_TAG_PREFIX):
+                    crop_id = tag[len(RECT_TAG_PREFIX):]
+                    if crop_id in self.crops:
+                         cx1, cy1, cx2, cy2 = self.canvas.coords(item_id)
+                         if (cx1 <= canvas_x <= cx2 and cy1 <= canvas_y <= cy2) or \
+                            (abs(canvas_x - cx1) <= tolerance) or (abs(canvas_x - cx2) <= tolerance) or \
+                            (abs(canvas_y - cy1) <= tolerance) or (abs(canvas_y - cy2) <= tolerance) :
+                              clicked_crop_id = crop_id
+                              break
+            if clicked_crop_id:
+                 break
+
+        if clicked_crop_id:
+            self.select_crop(clicked_crop_id)
+
+    def on_mouse_drag(self, event):
+        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+
+        if self.is_drawing and self.current_rect_id:
+            if self.canvas_image_id:
+                 img_bbox_canvas = self.canvas.bbox(self.canvas_image_id)
+                 if img_bbox_canvas:
+                      min_cx, min_cy, max_cx, max_cy = img_bbox_canvas
+                      clamped_canvas_x = max(min_cx, min(canvas_x, max_cx))
+                      clamped_canvas_y = max(min_cy, min(canvas_y, max_cy))
+                      self.canvas.coords(self.current_rect_id, self.start_x, self.start_y, clamped_canvas_x, clamped_canvas_y)
+                 else:
+                      self.canvas.coords(self.current_rect_id, self.start_x, self.start_y, canvas_x, canvas_y)
+            else:
+                 self.canvas.coords(self.current_rect_id, self.start_x, self.start_y, canvas_x, canvas_y)
+
+        elif self.is_moving and self.selected_crop_id and self.start_coords_canvas:
+            crop_id = self.selected_crop_id
+            rect_id = self.crops[crop_id]['rect_id']
+
+            dx = canvas_x - self.start_x
+            dy = canvas_y - self.start_y
+
+            new_cx1 = self.start_coords_canvas[0] + dx
+            new_cy1 = self.start_coords_canvas[1] + dy
+            new_cx2 = self.start_coords_canvas[2] + dx
+            new_cy2 = self.start_coords_canvas[3] + dy
+
+            img_x1, img_y1 = self.canvas_to_image_coords(new_cx1, new_cy1)
+            img_x2, img_y2 = self.canvas_to_image_coords(new_cx2, new_cy2)
+
+            if img_x1 is not None:
+                 updated = self.update_crop_coords(crop_id, (img_x1, img_y1, img_x2, img_y2))
+                 if updated:
+                      validated_img_coords = self.crops[crop_id]['coords']
+                      cx1_final, cy1_final = self.image_to_canvas_coords(validated_img_coords[0], validated_img_coords[1])
+                      cx2_final, cy2_final = self.image_to_canvas_coords(validated_img_coords[2], validated_img_coords[3])
+                      self.canvas.coords(rect_id, cx1_final, cy1_final, cx2_final, cy2_final)
+
+        elif self.is_resizing and self.selected_crop_id and self.resize_handle and self.start_coords_img:
+            crop_id = self.selected_crop_id
+            rect_id = self.crops[crop_id]['rect_id']
+
+            ox1_img, oy1_img, ox2_img, oy2_img = self.start_coords_img
+
+            curr_img_x, curr_img_y = self.canvas_to_image_coords(canvas_x, canvas_y)
+            start_img_x, start_img_y = self.canvas_to_image_coords(self.start_x, self.start_y)
+
+            if curr_img_x is None or start_img_x is None: return
+
+            dx_img = curr_img_x - start_img_x
+            dy_img = curr_img_y - start_img_y
+
+            nx1, ny1, nx2, ny2 = ox1_img, oy1_img, ox2_img, oy2_img
+
+            if 'n' in self.resize_handle: ny1 = oy1_img + dy_img
+            if 's' in self.resize_handle: ny2 = oy2_img + dy_img
+            if 'w' in self.resize_handle: nx1 = ox1_img + dx_img
+            if 'e' in self.resize_handle: nx2 = ox2_img + dx_img
+
+            updated = self.update_crop_coords(crop_id, (nx1, ny1, nx2, ny2))
+
+            if updated:
+                 validated_img_coords = self.crops[crop_id]['coords']
+                 cx1_final, cy1_final = self.image_to_canvas_coords(validated_img_coords[0], validated_img_coords[1])
+                 cx2_final, cy2_final = self.image_to_canvas_coords(validated_img_coords[2], validated_img_coords[3])
+                 self.canvas.coords(rect_id, cx1_final, cy1_final, cx2_final, cy2_final)
 
 
-    def _on_selection_changed(self, selected_crop_id: Optional[str]):
-        """Callback from CropManager when selected crop changes."""
-        is_selected = selected_crop_id is not None
-        self.btn_delete_crop.configure(state=tk.NORMAL if is_selected else tk.DISABLED)
-        self.btn_rename_crop.configure(state=tk.NORMAL if is_selected else tk.DISABLED)
-        self._update_status_bar_selection_info()
+    def on_mouse_release(self, event):
+        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+
+        if self.is_drawing and self.current_rect_id:
+            if self.canvas.find_withtag(self.current_rect_id):
+                 self.canvas.delete(self.current_rect_id)
+
+            final_rect_canvas_coords = self.canvas.coords(self.current_rect_id) if self.current_rect_id else (self.start_x, self.start_y, canvas_x, canvas_y)
+
+            img_x1, img_y1 = self.canvas_to_image_coords(final_rect_canvas_coords[0], final_rect_canvas_coords[1])
+            img_x2, img_y2 = self.canvas_to_image_coords(final_rect_canvas_coords[2], final_rect_canvas_coords[3])
+
+            if img_x1 is not None and img_y1 is not None and img_x2 is not None and img_y2 is not None:
+                 self.add_crop(img_x1, img_y1, img_x2, img_y2)
+
+        self.is_drawing = False
+        self.is_moving = False
+        self.is_resizing = False
+        self.resize_handle = None
+        self.current_rect_id = None
+        self.start_coords_img = None
+        self.start_coords_canvas = None
+
+        self.update_cursor(event)
+
+    # --- Zoom and Pan Handlers ---
+    def on_mouse_wheel(self, event, direction=None):
+        if not self.original_image: return
+
+        if direction:
+            delta = direction
+        elif event.num == 5 or event.delta < 0:
+            delta = -1
+        elif event.num == 4 or event.delta > 0:
+            delta = 1
+        else:
+            return
+
+        zoom_increment = 1.1
+        min_zoom = 0.01
+        max_zoom = 20.0
+
+        canvas_center_x = self.canvas.canvasx(event.x)
+        canvas_center_y = self.canvas.canvasy(event.y)
+
+        img_x_before, img_y_before = self.canvas_to_image_coords(canvas_center_x, canvas_center_y)
+        if img_x_before is None: return
+
+        new_zoom = self.zoom_factor * zoom_increment if delta > 0 else self.zoom_factor / zoom_increment
+        new_zoom = max(min_zoom, min(max_zoom, new_zoom))
+
+        if new_zoom == self.zoom_factor: return
+
+        self.zoom_factor = new_zoom
+
+        self.canvas_offset_x = canvas_center_x - (img_x_before * self.zoom_factor)
+        self.canvas_offset_y = canvas_center_y - (img_y_before * self.zoom_factor)
+
+        self.display_image_on_canvas()
+
+    def on_pan_press(self, event):
+        if not self.original_image: return
+        self.is_panning = True
+        self.pan_start_x = self.canvas.canvasx(event.x)
+        self.pan_start_y = self.canvas.canvasy(event.y)
+        self.canvas.config(cursor="fleur")
+
+    def on_pan_drag(self, event):
+        if not self.is_panning or not self.original_image: return
+        current_x = self.canvas.canvasx(event.x)
+        current_y = self.canvas.canvasy(event.y)
+        dx = current_x - self.pan_start_x
+        dy = current_y - self.pan_start_y
+
+        self.canvas_offset_x += dx
+        self.canvas_offset_y += dy
+
+        self.canvas.move("all", dx, dy)
+
+        self.pan_start_x = current_x
+        self.pan_start_y = current_y
+
+    def on_pan_release(self, event):
+        self.is_panning = False
+        self.update_cursor(event)
+
+    # --- Listbox Event Handlers ---
+    def on_listbox_select(self, event=None):
+        """Handles selection changes in the listbox."""
+        selection = self.crop_listbox.curselection()
+
+        if selection:
+             self.btn_delete_crops.configure(state=tk.NORMAL)
+        else:
+             self.btn_delete_crops.configure(state=tk.DISABLED)
+
+        if len(selection) == 1:
+            selected_index = selection[0]
+            if selected_index < len(self.crop_order):
+                 selected_crop_id = self.crop_order[selected_index]
+                 self.select_crop(selected_crop_id, from_listbox=True)
+            else:
+                 print("Warning: Listbox index out of sync with crop_order.")
+                 self.select_crop(None, from_listbox=True)
+        else:
+            self.select_crop(None, from_listbox=True)
+
+    def on_listbox_double_click(self, event):
+        """Handles double-click on a listbox item to rename it."""
+        try:
+            selected_index = self.crop_listbox.nearest(event.y)
+            bbox = self.crop_listbox.bbox(selected_index)
+            if not bbox or not (bbox[1] <= event.y <= bbox[1] + bbox[3]):
+                return
+
+            if selected_index < len(self.crop_order):
+                crop_id = self.crop_order[selected_index]
+                current_name = self.crops[crop_id]['name']
+
+                new_name = simpledialog.askstring(
+                    "Rename Crop",
+                    "Enter new name for this crop:",
+                    parent=self,
+                    initialvalue=current_name
+                )
+
+                if new_name and new_name.strip() and new_name.strip() != current_name:
+                    self.crops[crop_id]['name'] = new_name.strip()
+                    # Update the specific item in the listbox instead of refreshing all
+                    self.crop_listbox.delete(selected_index)
+                    self.crop_listbox.insert(selected_index, self.crops[crop_id]['name'])
+                    # Restore selection after replacing the item
+                    self.crop_listbox.selection_set(selected_index)
+                    self.crop_listbox.activate(selected_index)
+                    # Note: This manual update doesn't trigger <<ListboxSelect>>.
+                    # If needed, manually call self.on_listbox_select()
+
+        except IndexError:
+            pass
+        except Exception as e:
+            print(f"Error during renaming: {e}")
+
+    # --- Listbox Drag and Drop ---
+    def on_listbox_press(self, event):
+        try:
+            pressed_index = self.crop_listbox.nearest(event.y)
+            bbox = self.crop_listbox.bbox(pressed_index)
+            if not bbox or not (bbox[1] <= event.y <= bbox[1] + bbox[3]):
+                 self.reset_listbox_drag_state()
+                 return
+
+            if pressed_index < len(self.crop_order):
+                self.drag_start_index = pressed_index
+                self.drag_item_id = self.crop_order[pressed_index]
+                self.is_dragging_listbox = False # Set true in motion
+                # self.crop_listbox.config(cursor="fleur") # Optional: change cursor
+        except IndexError:
+            self.reset_listbox_drag_state()
+            pass
+
+    def on_listbox_drag(self, event):
+        if self.drag_item_id is None: return
+
+        self.is_dragging_listbox = True # Now definitely dragging
+
+        try:
+            # Get the index the mouse is currently over
+            current_index = self.crop_listbox.nearest(event.y)
+            current_index = max(0, min(current_index, self.crop_listbox.size())) # Clamp
+
+            # Visual feedback: Could potentially highlight the target row index
+            # This is hard with standard Listbox without breaking selection visuals.
+            # Skipping visual drag feedback during motion for simplicity.
+
+        except IndexError:
+            # Mouse outside listbox bounds
+            y_pos = event.y
+            listbox_height = self.crop_listbox.winfo_height()
+            if y_pos < 0: current_index = 0
+            elif y_pos > listbox_height: current_index = self.crop_listbox.size()
+            else: current_index = None # Mouse is within the listbox widget but somehow nearest failed?
+
+        if current_index is not None and self.drag_start_index is not None and current_index != self.drag_start_index:
+             # Move the item temporarily in the listbox for visual feedback
+             # This is simpler than drawing lines/ghosts
+             item_name = self.crops[self.drag_item_id]['name']
+             self.crop_listbox.delete(self.drag_start_index)
+             self.crop_listbox.insert(current_index, item_name)
+
+             # Update internal drag start index for the *next* drag event
+             # As we moved the item visually, its index is now `current_index`
+             self.drag_start_index = current_index
+
+             # Need to update selection as delete/insert clears it
+             self.crop_listbox.selection_clear(0, tk.END)
+             self.crop_listbox.selection_set(current_index)
+             self.crop_listbox.activate(current_index)
 
 
-    # --- Keyboard Shortcut Handlers ---
-    def _handle_delete_event(self, event=None):
-        """Handles the Delete key press."""
-        # Delegate delete action to a dedicated method that checks selection
-        self._delete_selected_crop()
-        return "break" # Prevent default widget behavior
+    def on_listbox_release(self, event):
+        if not self.is_dragging_listbox or self.drag_item_id is None:
+            self.reset_listbox_drag_state()
+            # If only single item selected on press, ensure it stays selected after release
+            if self.drag_start_index is not None and self.drag_start_index < self.crop_listbox.size():
+                 self.crop_listbox.selection_clear(0, tk.END)
+                 self.crop_listbox.selection_set(self.drag_start_index)
+                 self.crop_listbox.activate(self.drag_start_index)
+            return
 
-    def _delete_selected_crop(self):
-        """Deletes the currently selected crop."""
-        if self.crop_manager and self.crop_manager.selected_crop_id:
-            self.crop_manager.delete_crop(self.crop_manager.selected_crop_id)
-            self._update_status_bar(action_text="Crop Deleted")
+        # If a drag occurred, the visual Listbox is already updated.
+        # Need to update the internal crop_order list to match the *final* visual state.
 
+        # Find the final position of the dragged item's ID in the visually reordered listbox
+        final_index = -1
+        for i in range(self.crop_listbox.size()):
+            # Match by crop_id, looking up name from self.crops
+            item_name_in_listbox = self.crop_listbox.get(i)
+            # Find the crop_id that has this name and matches the dragged_item_id
+            found_crop_id = None
+            for cid, data in self.crops.items():
+                 if data['name'] == item_name_in_listbox and cid == self.drag_item_id:
+                      found_crop_id = cid
+                      break
+            if found_crop_id == self.drag_item_id:
+                 final_index = i
+                 break # Found the dragged item's final position
 
-    def _handle_nudge(self, dx_img: int, dy_img: int):
-        """Handles arrow key nudge."""
-        if self.crop_manager and self.crop_manager.nudge_selected_crop(dx_img, dy_img):
-            self._update_status_bar(action_text="Nudged")
-            self._update_status_bar_selection_info() # Size might not change, but coords did
+        if final_index != -1:
+             # Rebuild crop_order based on the final listbox state
+             new_crop_order = []
+             for i in range(self.crop_listbox.size()):
+                 item_name = self.crop_listbox.get(i)
+                 # Find the crop_id corresponding to this name.
+                 # Need to handle potential duplicate names.
+                 # A more robust approach would be to store crop_id in the listbox item itself (e.g., using data attribute, but Listbox is limited)
+                 # Or ensure names are unique, or find the *correct* ID based on original state vs dragged ID.
+                 # For simplicity, assume names are unique enough for finding the ID here.
+                 # Better approach: Use the stored self.crops dict to map names back to IDs.
+                 found_id = None
+                 for cid, data in self.crops.items():
+                      if data['name'] == item_name:
+                           # Simple check: if the dragged item's name is duplicated, this could pick the wrong one.
+                           # Need a more robust way to map listbox index back to crop_id after visual drag.
+                           # The visual drag-and-drop in Listbox is tricky because it doesn't inherently carry data (like crop_id) per row.
+                           # The simplest reliable way after a visual drag is to rebuild crop_order by looking up IDs based on names
+                           # and assuming names are unique enough for lookup after reordering.
 
+                           # More robust approach: Rebuild crop_order by iterating the *visual* listbox contents
+                           # and finding the crop_id that matches the item name *and* isn't already added to the new_crop_order
+                           is_already_added = False
+                           for existing_id in new_crop_order:
+                                if existing_id in self.crops and self.crops[existing_id]['name'] == item_name:
+                                     is_already_added = True
+                                     break
+                           if not is_already_added:
+                                found_id = cid
+                                break # Found an ID for this name not already added
 
-    def _handle_resize_key(self, dx_img: int, dy_img: int, handle_dir: str):
-        """Handles Shift+arrow key resize."""
-        if self.crop_manager and self.crop_manager.resize_selected_crop_key(dx_img, dy_img, handle_dir):
-             self._update_status_bar(action_text="Resized")
-             self._update_status_bar_selection_info()
+                 if found_id:
+                      new_crop_order.append(found_id)
+                 else:
+                      print(f"Warning: Could not find unique crop_id for name '{item_name}' during reorder rebuild.")
 
+             if len(new_crop_order) == self.crop_listbox.size(): # Only update if we successfully mapped all items
+                  self.crop_order = new_crop_order
+                  # Selection is already set by on_listbox_drag or will be set by on_listbox_select
+                  # No need to call refresh_listbox here, as the visual listbox is already updated.
+                  # Trigger selection logic manually if needed, or rely on the next user click.
+                  # self.on_listbox_select() # Can call this to ensure canvas highlights match
 
-    # --- Window Resize Handling ---
-    def _on_window_resize(self, event=None):
-        """Handles window resize event. Schedules a canvas redraw."""
-        # Delay redraw slightly to avoid excessive redraws during interactive resizing
-        self.after(10, self._perform_delayed_resize_update)
+        self.reset_listbox_drag_state()
+        # self.crop_listbox.config(cursor="") # Optional: reset cursor
 
-    def _perform_delayed_resize_update(self):
-        """Performs canvas redraw after a small delay on window resize."""
-        # Recalculate zoom/pan to keep image centered if image was smaller than canvas
-        if self._original_image is not None:
-             canvas_w, canvas_h = self.canvas.winfo_width(), self.canvas.winfo_height()
-             img_w, img_h = self._original_image.size
+    def reset_listbox_drag_state(self):
+        self.is_dragging_listbox = False
+        self.drag_start_index = None
+        self.drag_item_id = None
+        # self.crop_listbox.config(cursor="") # Ensure cursor is reset
 
-             # Only adjust if the image was fitted *inside* the canvas originally
-             # or if canvas size changed significantly
-             current_zoom = self.coord_converter.zoom_factor
+    # --- Resizing Helpers ---
+    def get_resize_handle(self, canvas_x, canvas_y):
+        """Checks if the cursor is near a resize handle of the selected crop."""
+        if not self.selected_crop_id or self.selected_crop_id not in self.crops:
+            return None
 
-             # Calculate new offset to keep image centered *relative to canvas center*
-             # Find the image coords at the canvas center
-             canvas_center_x, canvas_center_y = canvas_w / 2.0, canvas_h / 2.0
-             img_center_x_before, img_center_y_before = self.coord_converter.canvas_to_image(canvas_center_x, canvas_center_y)
+        rect_id = self.crops[self.selected_crop_id]['rect_id']
+        if not self.canvas.find_withtag(rect_id):
+            return None
 
-             if img_center_x_before is not None:
-                  # Calculate new offset based on keeping that image point at the new canvas center
-                  new_offset_x = canvas_center_x - (img_center_x_before * current_zoom)
-                  new_offset_y = canvas_center_y - (img_center_y_before * current_zoom)
+        cx1, cy1, cx2, cy2 = self.canvas.coords(rect_id)
+        margin = RESIZE_HANDLE_MARGIN
 
-                  # Update coordinate converter and redraw
-                  self.coord_converter.set_zoom_pan(current_zoom, new_offset_x, new_offset_y)
-                  if self.canvas_handler:
-                      self.canvas_handler._redraw_canvas_content()
+        dist_w = abs(canvas_x - cx1)
+        dist_e = abs(canvas_x - cx2)
+        dist_n = abs(canvas_y - cy1)
+        dist_s = abs(canvas_y - cy2)
 
-        # Update status bar zoom (it might not change, but refreshes layout)
-        self._update_status_bar(zoom_text=f"Zoom: {self.coord_converter.zoom_factor:.1%}")
+        is_near_h_edge = (cx1 - margin) <= canvas_x <= (cx2 + margin)
+        is_near_v_edge = (cy1 - margin) <= canvas_y <= (cy2 + margin)
+
+        handle = ''
+        if dist_n < margin and dist_w < margin: handle = 'nw'
+        elif dist_n < margin and dist_e < margin: handle = 'ne'
+        elif dist_s < margin and dist_w < margin: handle = 'sw'
+        elif dist_s < margin and dist_e < margin: handle = 'se'
+        elif dist_n < margin and is_near_h_edge: handle = 'n'
+        elif dist_s < margin and is_near_h_edge: handle = 's'
+        elif dist_w < margin and is_near_v_edge: handle = 'w'
+        elif dist_e < margin and is_near_v_edge: handle = 'e'
+
+        expanded_cx1 = cx1 - margin
+        expanded_cy1 = cy1 - margin
+        expanded_cx2 = cx2 + margin
+        expanded_cy2 = cy2 + margin
+        if not (expanded_cx1 <= canvas_x <= expanded_cx2 and expanded_cy1 <= canvas_y <= expanded_cy2):
+             return None
+
+        return handle if handle else None
+
+    def get_handle_cursor(self, handle):
+        """Maps handle names to Tk cursor names."""
+        if handle in ('nw', 'se'): return "size_nw_se"
+        elif handle in ('ne', 'sw'): return "size_ne_sw"
+        elif handle in ('n', 's'): return "size_ns"
+        elif handle in ('e', 'w'): return "size_we"
+        return ""
+
+    def update_cursor(self, event=None):
+        """Changes the mouse cursor based on position."""
+        if self.is_panning or self.is_moving or self.is_resizing or self.is_dragging_listbox:
+            return
+
+        new_cursor = ""
+
+        if event and self.original_image:
+            canvas_x = self.canvas.canvasx(event.x)
+            canvas_y = self.canvas.canvasy(event.y)
+
+            if self.selected_crop_id:
+                 handle = self.get_resize_handle(canvas_x, canvas_y)
+                 if handle:
+                      new_cursor = self.get_handle_cursor(handle)
+                      self.canvas.config(cursor=new_cursor)
+                      return
+
+            if self.selected_crop_id and self.selected_crop_id in self.crops:
+                 rect_id = self.crops[self.selected_crop_id]['rect_id']
+                 if self.canvas.find_withtag(rect_id):
+                      cx1, cy1, cx2, cy2 = self.canvas.coords(rect_id)
+                      buffer = 2
+                      if (cx1 + buffer) < canvas_x < (cx2 - buffer) and (cy1 + buffer) < canvas_y < (cy2 - buffer):
+                          new_cursor = "fleur"
+                          self.canvas.config(cursor=new_cursor)
+                          return
+
+        if self.canvas.cget("cursor") != "":
+             self.canvas.config(cursor="")
+
+    # --- Window/Canvas Resize Handling ---
+    def on_canvas_configure(self, event=None):
+         """Handler for when the canvas widget changes size."""
+         if self.original_image and self.tk_image:
+             canvas_center_x = self.canvas.winfo_width() / 2
+             canvas_center_y = self.canvas.winfo_height() / 2
+             img_center_x, img_center_y = self.canvas_to_image_coords(self.canvas.canvasx(canvas_center_x), self.canvas.canvasy(canvas_center_y))
+
+             new_canvas_offset_x = self.canvas.winfo_width() / 2 - (img_center_x * self.zoom_factor) if img_center_x is not None else self.canvas_offset_x
+             new_canvas_offset_y = self.canvas.winfo_height() / 2 - (img_center_y * self.zoom_factor) if img_center_y is not None else self.canvas_offset_y
+
+             self.canvas_offset_x = new_canvas_offset_x
+             self.canvas_offset_y = new_canvas_offset_y
+
+             self.display_image_on_canvas()
+
+         elif not self.original_image and self.canvas.find_all():
+             self.canvas.delete("all")
+
+    # --- Saving Crops ---
+    def save_crops(self):
+        if not self.original_image or not self.image_path:
+            messagebox.showwarning("No Image", "Please select an image first.")
+            return
+        if not self.crops:
+            messagebox.showwarning("No Crops", "Please define at least one crop area.")
+            return
+
+        base_name = os.path.splitext(os.path.basename(self.image_path))[0]
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        output_dir = os.path.join(script_dir, base_name)
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Directory Error", f"Could not create output directory:\n{output_dir}\n{e}")
+            return
+
+        saved_count = 0
+        error_count = 0
+
+        # Iterate through crops using the user-defined order (self.crop_order)
+        for i, crop_id in enumerate(self.crop_order, start=1):
+            if crop_id in self.crops:
+                data = self.crops[crop_id]
+                coords = tuple(map(int, data['coords']))
+
+                filename = f"{base_name}_{i}.jpg"
+                filepath = os.path.join(output_dir, filename)
+
+                try:
+                    img_w, img_h = self.original_image.size
+                    valid_coords = (
+                        max(0, coords[0]), max(0, coords[1]),
+                        min(img_w, coords[2]), min(img_h, coords[3])
+                    )
+                    if valid_coords[2] > valid_coords[0] and valid_coords[3] > valid_coords[1]:
+                        cropped_img = self.original_image.crop(valid_coords)
+                        if cropped_img.mode in ('RGBA', 'P'):
+                            cropped_img = cropped_img.convert('RGB')
+                        cropped_img.save(filepath, "JPEG", quality=95)
+                        saved_count += 1
+                    else:
+                         error_count += 1
+                         print(f"Error saving {filename}: Invalid crop dimensions {valid_coords}")
+
+                except Exception as e:
+                    error_count += 1
+                    print(f"Error saving {filename}: {e}")
+
+            else:
+                print(f"Warning: crop_id {crop_id} found in crop_order but not in crops dictionary during save!")
+                error_count += 1
+
+        if saved_count > 0 or error_count > 0:
+            if error_count == 0:
+                messagebox.showinfo("Success", f"Successfully saved {saved_count} crops to the '{base_name}' folder.")
+            else:
+                messagebox.showwarning("Partial Success", f"Saved {saved_count} crops to '{base_name}'.\nFailed to save {error_count} crops. Check console/log for details.")
+        else:
+            messagebox.showinfo("No Crops Saved", "No valid crops were saved.")
 
 
 # --- Run the Application ---
