@@ -1,20 +1,18 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, Listbox, simpledialog
+from tkinter import filedialog, messagebox, Listbox, simpledialog # Added simpledialog for renaming
 import customtkinter as ctk
 from PIL import Image, ImageTk
 import os
-import uuid
-import math
-import sys
-import re # Import regex
+import uuid # To generate unique IDs for crops internally
+import math # For ceiling function in centering
 
 # --- Constants ---
 RECT_TAG_PREFIX = "crop_rect_"
 DEFAULT_RECT_COLOR = "red"
 SELECTED_RECT_COLOR = "blue"
 RECT_WIDTH = 2
-MIN_CROP_SIZE = 10
-RESIZE_HANDLE_MARGIN = 6
+MIN_CROP_SIZE = 10 # Minimum width/height for a crop in pixels
+# OUTPUT_FOLDER generation is now dynamic based on image name
 
 # --- Main Application Class ---
 class MultiCropApp(ctk.CTk):
@@ -22,8 +20,8 @@ class MultiCropApp(ctk.CTk):
         super().__init__()
 
         # --- Window Setup ---
-        self.title("Multi Image Cropper")
-        self.geometry("1000x700")
+        self.title("Multi Image Cropper (Improved)")
+        self.geometry("1100x750") # Slightly larger for better layout
         ctk.set_appearance_mode("Light")
         ctk.set_default_color_theme("blue")
 
@@ -34,21 +32,23 @@ class MultiCropApp(ctk.CTk):
         self.tk_image = None
         self.canvas_image_id = None
 
-        # Crop Data and Order
-        self.crops = {}            # {crop_id: {'coords': (x1,y1,x2,y2), 'name': name, 'rect_id': canvas_rect_id}}
-        self.crop_order = []       # List of crop_ids in the desired user order
-        self.selected_crop_id = None # Currently selected single crop ID for canvas editing
+        # Crop Data Management
+        self.crops = {}           # {crop_id: {'coords': (x1,y1,x2,y2), 'name': display_name, 'rect_id': canvas_rect_id}}
+        self.crop_order = []      # List of crop_ids maintaining the user-defined order
+        self.used_crop_numbers = set() # Set to track numbers used in default names (e.g., {1, 2, 4})
+        self.selected_crop_ids = [] # Can hold multiple IDs for multi-delete
 
         # Drawing/Editing State
         self.start_x = None
         self.start_y = None
-        self.current_rect_id = None # ID of the temporary drawing rectangle
+        self.current_rect_id = None
         self.is_drawing = False
         self.is_moving = False
         self.is_resizing = False
         self.resize_handle = None
-        self.start_coords_img = None # Store image coords when starting move/resize
-        self.start_coords_canvas = None # Store canvas coords when starting move
+        self.move_offset_x = 0
+        self.move_offset_y = 0
+        self.last_click_item_id = None # Store ID of item under last press for potential move
 
         # Zoom/Pan State
         self.zoom_factor = 1.0
@@ -58,14 +58,12 @@ class MultiCropApp(ctk.CTk):
         self.canvas_offset_x = 0
         self.canvas_offset_y = 0
 
-        # Listbox Drag/Drop State
-        self.is_dragging_listbox = False
+        # Listbox Drag & Drop State
         self.drag_start_index = None
-        self.drag_item_id = None
 
         # --- UI Layout ---
-        self.grid_columnconfigure(0, weight=3)
-        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=3) # Image area
+        self.grid_columnconfigure(1, weight=1) # Control panel
         self.grid_rowconfigure(0, weight=1)
 
         # --- Left Frame (Image Display) ---
@@ -74,14 +72,15 @@ class MultiCropApp(ctk.CTk):
         self.image_frame.grid_rowconfigure(0, weight=1)
         self.image_frame.grid_columnconfigure(0, weight=1)
 
+        # Canvas
         self.canvas = tk.Canvas(self.image_frame, bg="gray90", highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
 
         # --- Right Frame (Controls) ---
-        self.control_frame = ctk.CTkFrame(self, width=250)
+        self.control_frame = ctk.CTkFrame(self, width=280) # Slightly wider
         self.control_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
         self.control_frame.grid_propagate(False)
-        self.control_frame.grid_rowconfigure(3, weight=1)
+        self.control_frame.grid_rowconfigure(4, weight=1) # Listbox row takes expansion
         self.control_frame.grid_columnconfigure(0, weight=1)
 
         # Buttons
@@ -92,45 +91,62 @@ class MultiCropApp(ctk.CTk):
         self.btn_save_crops.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
 
         # Crop List Label
-        self.lbl_crop_list = ctk.CTkLabel(self.control_frame, text="Crop List (Drag to reorder, Double-click to rename):")
+        self.lbl_crop_list = ctk.CTkLabel(self.control_frame, text="Crop List (Drag to Reorder, Double-Click to Rename):")
         self.lbl_crop_list.grid(row=2, column=0, padx=10, pady=(10, 0), sticky="w")
 
-        # Crop Listbox
-        self.crop_listbox = Listbox(self.control_frame,
+        # Crop Listbox Frame (to hold listbox and scrollbar)
+        self.listbox_frame = ctk.CTkFrame(self.control_frame, fg_color="transparent")
+        self.listbox_frame.grid(row=3, column=0, padx=10, pady=5, sticky="nsew")
+        self.listbox_frame.grid_rowconfigure(0, weight=1)
+        self.listbox_frame.grid_columnconfigure(0, weight=1)
+
+        # Scrollbar for Listbox
+        self.listbox_scrollbar = ctk.CTkScrollbar(self.listbox_frame, command=None) # Command set later
+        self.listbox_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        # Crop Listbox (Light theme adjustments)
+        self.crop_listbox = Listbox(self.listbox_frame,
                                     bg='white', fg='black',
-                                    selectbackground='#CDEAFE',
+                                    selectbackground='#ADD8E6', # Light blue selection
                                     selectforeground='black',
                                     highlightthickness=1, highlightbackground="#CCCCCC",
                                     highlightcolor="#89C4F4",
                                     borderwidth=0, exportselection=False,
-                                    selectmode=tk.EXTENDED)
-        self.crop_listbox.grid(row=3, column=0, padx=10, pady=5, sticky="nsew")
+                                    selectmode=tk.EXTENDED, # *** CHANGE: Allow multi-select ***
+                                    yscrollcommand=self.listbox_scrollbar.set) # Link scrollbar
+        self.crop_listbox.grid(row=0, column=0, sticky="nsew")
+        self.listbox_scrollbar.configure(command=self.crop_listbox.yview) # Link scrollbar back
 
-        # Bindings for Listbox
-        self.crop_listbox.bind("<<ListboxSelect>>", self.on_listbox_select)
-        self.crop_listbox.bind("<Double-Button-1>", self.on_listbox_double_click)
-        self.crop_listbox.bind("<ButtonPress-1>", self.on_listbox_press)
-        self.crop_listbox.bind("<B1-Motion>", self.on_listbox_drag)
-        self.crop_listbox.bind("<ButtonRelease-1>", self.on_listbox_release)
+        # Delete Button (text changed for multi-select)
+        self.btn_delete_crop = ctk.CTkButton(self.control_frame, text="Delete Selected Crop(s)", command=self.delete_selected_crops, state=tk.DISABLED, fg_color="#F44336", hover_color="#D32F2F")
+        self.btn_delete_crop.grid(row=4, column=0, padx=10, pady=(5, 10), sticky="ew")
 
-        # Delete Button
-        self.btn_delete_crops = ctk.CTkButton(self.control_frame, text="Delete Selected Crops", command=self.delete_selected_crops, state=tk.DISABLED, fg_color="#F44336", hover_color="#D32F2F")
-        self.btn_delete_crops.grid(row=4, column=0, padx=10, pady=(5, 10), sticky="ew")
-
-        # --- Canvas Bindings ---
+        # --- Bindings ---
+        # Canvas Bindings
         self.canvas.bind("<ButtonPress-1>", self.on_mouse_press)
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_release)
-        self.canvas.bind("<Double-Button-1>", self.on_canvas_double_click)
+        self.canvas.bind("<Double-Button-1>", self.on_canvas_double_click) # *** ADDED: Double click ***
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
-        self.canvas.bind("<ButtonPress-4>", lambda e: self.on_mouse_wheel(e, 1)) # Linux scroll up
-        self.canvas.bind("<ButtonPress-5>", lambda e: self.on_mouse_wheel(e, -1)) # Linux scroll down
-        self.canvas.bind("<ButtonPress-2>", self.on_pan_press) # Middle mouse
+        self.canvas.bind("<ButtonPress-4>", lambda e: self.on_mouse_wheel(e, 1))
+        self.canvas.bind("<ButtonPress-5>", lambda e: self.on_mouse_wheel(e, -1))
+        self.canvas.bind("<ButtonPress-2>", self.on_pan_press)
         self.canvas.bind("<B2-Motion>", self.on_pan_drag)
         self.canvas.bind("<ButtonRelease-2>", self.on_pan_release)
         self.canvas.bind("<Motion>", self.update_cursor)
-        self.bind("<Delete>", self.delete_selected_crops_event)
-        self.canvas.bind("<Configure>", self.on_canvas_configure)
+
+        # Listbox Bindings
+        self.crop_listbox.bind("<<ListboxSelect>>", self.on_listbox_select)
+        self.crop_listbox.bind("<Double-Button-1>", self.on_listbox_double_click) # *** ADDED: Rename ***
+        self.crop_listbox.bind("<ButtonPress-1>", self.on_listbox_press)      # *** ADDED: Drag Start ***
+        self.crop_listbox.bind("<B1-Motion>", self.on_listbox_drag)          # *** ADDED: Drag Motion ***
+        self.crop_listbox.bind("<ButtonRelease-1>", self.on_listbox_release)    # *** ADDED: Drag End ***
+
+
+        # Global Key Bindings
+        self.bind("<Delete>", self.delete_selected_crops_event) # Changed to plural method
+        self.bind("<BackSpace>", self.delete_selected_crops_event) # MacOS delete key
+        self.bind("<Configure>", self.on_window_resize)
 
     # --- Image Handling ---
     def select_image(self):
@@ -142,72 +158,63 @@ class MultiCropApp(ctk.CTk):
             return
 
         try:
-            if self.crops:
-                if messagebox.askyesno("Save Current Work", "You have unsaved crops. Do you want to save them before opening a new image?"):
-                     self.save_crops()
-
             self.image_path = path
             self.original_image = Image.open(self.image_path)
-
-            self.clear_crops_and_list() # Clears all crop data
 
             self.update_idletasks()
             canvas_width = self.canvas.winfo_width()
             canvas_height = self.canvas.winfo_height()
 
             if canvas_width <= 1 or canvas_height <= 1:
-                 canvas_width = 800
-                 canvas_height = 600
+                print("Warning: Canvas size not available for initial fit.")
+                canvas_width, canvas_height = 600, 500 # Fallback
 
             img_width, img_height = self.original_image.size
             if img_width == 0 or img_height == 0:
                  raise ValueError("Image has zero dimension")
 
+            zoom_h = canvas_width / img_width
+            zoom_v = canvas_height / img_height
+            initial_zoom = min(zoom_h, zoom_v)
             padding_factor = 0.98
-            zoom_h = (canvas_width * padding_factor) / img_width
-            zoom_v = (canvas_height * padding_factor) / img_height
-            self.zoom_factor = min(1.0, min(zoom_h, zoom_v))
+            self.zoom_factor = min(1.0, initial_zoom) * padding_factor
 
             display_w = img_width * self.zoom_factor
             display_h = img_height * self.zoom_factor
             self.canvas_offset_x = math.ceil((canvas_width - display_w) / 2)
             self.canvas_offset_y = math.ceil((canvas_height - display_h) / 2)
 
+            self.clear_all_crops() # Reset everything for new image
             self.display_image_on_canvas()
             self.btn_save_crops.configure(state=tk.DISABLED)
-            self.btn_delete_crops.configure(state=tk.DISABLED)
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open or process image:\n{e}")
             self.image_path = None
             self.original_image = None
-            self.clear_crops_and_list()
+            self.clear_all_crops()
             self.canvas.delete("all")
             self.tk_image = None
             self.display_image = None
             self.btn_save_crops.configure(state=tk.DISABLED)
-            self.btn_delete_crops.configure(state=tk.DISABLED)
 
-    def clear_crops_and_list(self):
-        """Clears existing crops, listbox, and resets related states."""
+    def clear_all_crops(self):
+        """Clears all crop data, listbox, order, numbers, and selection."""
         self.canvas.delete("crop_rect")
         self.crops.clear()
-        self.crop_order.clear()
-        self.refresh_listbox()
-        self.selected_crop_id = None
-        self.btn_delete_crops.configure(state=tk.DISABLED)
+        self.crop_order = []
+        self.used_crop_numbers = set()
+        self.selected_crop_ids = []
+        self.crop_listbox.delete(0, tk.END)
+        self.update_button_states()
 
     def display_image_on_canvas(self):
-        """Displays the current self.display_image on the canvas respecting zoom and pan."""
         if not self.original_image:
             self.canvas.delete("all")
             return
 
-        disp_w = int(self.original_image.width * self.zoom_factor)
-        disp_h = int(self.original_image.height * self.zoom_factor)
-
-        disp_w = max(1, disp_w)
-        disp_h = max(1, disp_h)
+        disp_w = max(1, int(self.original_image.width * self.zoom_factor))
+        disp_h = max(1, int(self.original_image.height * self.zoom_factor))
 
         try:
             self.display_image = self.original_image.resize((disp_w, disp_h), Image.Resampling.LANCZOS)
@@ -218,10 +225,7 @@ class MultiCropApp(ctk.CTk):
              return
 
         self.tk_image = ImageTk.PhotoImage(self.display_image)
-
-        self.canvas.delete("image")
-        self.canvas.delete("crop_rect")
-
+        self.canvas.delete("all") # Clear everything first
         int_offset_x = int(round(self.canvas_offset_x))
         int_offset_y = int(round(self.canvas_offset_y))
 
@@ -229,406 +233,389 @@ class MultiCropApp(ctk.CTk):
             int_offset_x, int_offset_y,
             anchor=tk.NW, image=self.tk_image, tags="image"
         )
-
-        self.redraw_all_crops()
+        self.redraw_all_crops() # Redraw crops respecting new zoom/pan
 
     # --- Coordinate Conversion ---
     def canvas_to_image_coords(self, canvas_x, canvas_y):
-        """Convert canvas coordinates to original image coordinates."""
         if not self.original_image or self.zoom_factor == 0: return None, None
         img_x = (canvas_x - self.canvas_offset_x) / self.zoom_factor
         img_y = (canvas_y - self.canvas_offset_y) / self.zoom_factor
-
-        img_width, img_height = self.original_image.size
-        img_x = max(0, min(img_x, img_width))
-        img_y = max(0, min(img_y, img_height))
-
         return img_x, img_y
 
     def image_to_canvas_coords(self, img_x, img_y):
-        """Convert original image coordinates to canvas coordinates."""
         if not self.original_image: return None, None
         canvas_x = (img_x * self.zoom_factor) + self.canvas_offset_x
         canvas_y = (img_y * self.zoom_factor) + self.canvas_offset_y
         return canvas_x, canvas_y
 
     # --- Crop Handling ---
-    def find_next_default_crop_number(self):
-        """Finds the smallest positive integer not currently used in default crop names."""
-        used_numbers = set()
-        # Regex to find a number at the end, optionally preceded by common separators and 'crop'
-        # More robust: look for a number at the end preceded by non-digits
-        # Simple version: look for '_number' or 'number' at the end
-        pattern = re.compile(r'_?(\d+)$') # Matches _123 or 123 at the end
-
-        for crop_data in self.crops.values():
-            name = crop_data['name']
-            match = pattern.search(name)
-            if match:
-                try:
-                    number = int(match.group(1))
-                    used_numbers.add(number)
-                except ValueError:
-                    pass # Ignore names that look like they end in a number but aren't parseable
-
-        n = 1
-        while n in used_numbers:
-            n += 1
-        return n
-
+    def find_available_crop_number(self):
+        """Finds the smallest positive integer not in self.used_crop_numbers."""
+        i = 1
+        while i in self.used_crop_numbers:
+            i += 1
+        return i
 
     def add_crop(self, x1_img, y1_img, x2_img, y2_img):
-        """Adds a new crop definition, adds it to the order, and redraws."""
         if not self.original_image: return
 
         img_w, img_h = self.original_image.size
+        x1_img = max(0, min(x1_img, img_w))
+        y1_img = max(0, min(y1_img, img_h))
+        x2_img = max(0, min(x2_img, img_w))
+        y2_img = max(0, min(y2_img, img_h))
 
-        x1_img = max(0.0, min(x1_img, img_w))
-        y1_img = max(0.0, min(y1_img, img_h))
-        x2_img = max(0.0, min(x2_img, img_w))
-        y2_img = max(0.0, min(y2_img, img_h))
-
-        final_x1 = min(x1_img, x2_img)
-        final_y1 = min(y1_img, y2_img)
-        final_x2 = max(x1_img, x2_img)
-        final_y2 = max(y1_img, y2_img)
-
-        if (final_x2 - final_x1) < MIN_CROP_SIZE or (final_y2 - final_y1) < MIN_CROP_SIZE:
+        if abs(x2_img - x1_img) < MIN_CROP_SIZE or abs(y2_img - y1_img) < MIN_CROP_SIZE:
+            print("Crop too small, ignoring.")
+            if self.current_rect_id: self.canvas.delete(self.current_rect_id)
+            self.current_rect_id = None
             return
 
-        coords = (final_x1, final_y1, final_x2, final_y2)
+        coords = (min(x1_img, x2_img), min(y1_img, y2_img),
+                  max(x1_img, x2_img), max(y1_img, y2_img))
 
         crop_id = str(uuid.uuid4())
-        base_name = os.path.splitext(os.path.basename(self.image_path))[0] if self.image_path else "Image"
+        crop_number = self.find_available_crop_number() # *** Use new logic ***
+        self.used_crop_numbers.add(crop_number)        # *** Track used number ***
 
-        # Use the calculated next available number for the default name
-        next_num = self.find_next_default_crop_number()
-        crop_name = f"{base_name}_Crop_{next_num}"
+        base_name = os.path.splitext(os.path.basename(self.image_path))[0] if self.image_path else "Image"
+        crop_name = f"{base_name}_Crop_{crop_number}" # Default display name
 
         cx1, cy1 = self.image_to_canvas_coords(coords[0], coords[1])
         cx2, cy2 = self.image_to_canvas_coords(coords[2], coords[3])
 
         if cx1 is None:
-             print("Error: Cannot add crop, coordinate conversion failed.")
-             return
+            print("Error: Cannot draw crop, coordinate conversion failed.")
+            self.used_crop_numbers.discard(crop_number) # Rollback number usage
+            return
 
         rect_id = self.canvas.create_rectangle(
             cx1, cy1, cx2, cy2,
             outline=DEFAULT_RECT_COLOR, width=RECT_WIDTH,
-            tags=(RECT_TAG_PREFIX + crop_id, "crop_rect")
+            tags=(RECT_TAG_PREFIX + crop_id, "crop_rect") # Assign unique tag
         )
 
-        self.crops[crop_id] = {
-            'coords': coords,
-            'name': crop_name,
-            'rect_id': rect_id
-        }
-        self.crop_order.append(crop_id)
+        self.crops[crop_id] = {'coords': coords, 'name': crop_name, 'rect_id': rect_id}
+        self.crop_order.append(crop_id) # Add to the end of the ordered list
 
-        self.refresh_listbox()
-        new_index = len(self.crop_order) - 1
-        if new_index >= 0:
-            self.crop_listbox.selection_clear(0, tk.END)
-            self.crop_listbox.selection_set(new_index)
-            self.crop_listbox.activate(new_index)
-            self.crop_listbox.see(new_index)
-            self.select_crop(crop_id, from_listbox=False)
+        # Add to listbox and select it
+        self.rebuild_listbox() # Rebuild to ensure order is correct
+        new_index = self.crop_order.index(crop_id)
+        self.crop_listbox.selection_clear(0, tk.END)
+        self.crop_listbox.selection_set(new_index)
+        self.on_listbox_select() # Trigger selection logic
 
-        self.btn_save_crops.configure(state=tk.NORMAL)
-        # Delete button state handled by on_listbox_select
+        self.update_button_states()
 
-    def select_crop(self, crop_id, from_listbox=False):
-        """Selects a crop by its ID, updates visuals on canvas."""
-        if self.selected_crop_id and self.selected_crop_id in self.crops:
-             prev_rect_id = self.crops[self.selected_crop_id]['rect_id']
-             if self.canvas.find_withtag(prev_rect_id):
-                  self.canvas.itemconfig(prev_rect_id, outline=DEFAULT_RECT_COLOR)
+    def get_crop_id_from_list_index(self, index):
+        """ Safely get crop_id from listbox index using self.crop_order. """
+        if 0 <= index < len(self.crop_order):
+            return self.crop_order[index]
+        return None
 
-        self.selected_crop_id = crop_id
+    def get_list_index_from_crop_id(self, crop_id):
+        """ Safely get listbox index from crop_id using self.crop_order. """
+        try:
+            return self.crop_order.index(crop_id)
+        except ValueError:
+            return -1
 
-        if crop_id and crop_id in self.crops:
-            rect_id = self.crops[crop_id]['rect_id']
-            if self.canvas.find_withtag(rect_id):
-                 self.canvas.itemconfig(rect_id, outline=SELECTED_RECT_COLOR)
-                 self.canvas.tag_raise(rect_id)
+    def select_crops(self, crop_ids_to_select):
+        """Selects one or more crops by ID, updating visuals."""
+        # Deselect previously selected crops visually
+        for prev_id in self.selected_crop_ids:
+            if prev_id in self.crops:
+                rect_id = self.crops[prev_id]['rect_id']
+                if rect_id in self.canvas.find_withtag(rect_id):
+                     self.canvas.itemconfig(rect_id, outline=DEFAULT_RECT_COLOR)
 
-                 if not from_listbox:
-                      try:
-                          index = self.crop_order.index(crop_id)
-                          self.crop_listbox.selection_clear(0, tk.END)
-                          self.crop_listbox.selection_set(index)
-                          self.crop_listbox.activate(index)
-                          self.crop_listbox.see(index)
-                      except ValueError:
-                           print(f"Error: crop_id {crop_id} not found in crop_order.")
-                           self.crop_listbox.selection_clear(0, tk.END)
-                           self.selected_crop_id = None
+        self.selected_crop_ids = list(crop_ids_to_select) # Make a copy
 
+        # Select new ones visually
+        for crop_id in self.selected_crop_ids:
+            if crop_id in self.crops:
+                rect_id = self.crops[crop_id]['rect_id']
+                if rect_id in self.canvas.find_withtag(rect_id):
+                     self.canvas.itemconfig(rect_id, outline=SELECTED_RECT_COLOR)
+                     self.canvas.tag_raise(rect_id) # Bring selected rects to front
+                else:
+                    print(f"Warning: Stale rectangle ID {rect_id} for crop {crop_id}")
+                    # Optionally remove invalid ID from selection here
             else:
-                 print(f"Warning: Stale rectangle ID {rect_id} for crop {crop_id}")
-                 if crop_id in self.crops:
-                      del self.crops[crop_id]
-                 if crop_id in self.crop_order:
-                      self.crop_order.remove(crop_id)
-                 self.refresh_listbox()
-                 self.selected_crop_id = None
+                 print(f"Warning: Attempted to select non-existent crop ID {crop_id}")
+                 # Optionally remove invalid ID from selection here
 
-        else:
-            self.selected_crop_id = None
-            if not from_listbox:
-                 self.crop_listbox.selection_clear(0, tk.END)
+        self.update_button_states()
+
+        # Ensure listbox selection matches (might trigger on_listbox_select again)
+        self.update_listbox_selection_visuals()
+
 
     def update_crop_coords(self, crop_id, new_img_coords):
         """Updates the stored original image coordinates for a crop."""
         if crop_id in self.crops and self.original_image:
              img_w, img_h = self.original_image.size
              x1, y1, x2, y2 = new_img_coords
+             # Clamp coordinates
+             x1 = max(0, min(x1, img_w))
+             y1 = max(0, min(y1, img_h))
+             x2 = max(0, min(x2, img_w))
+             y2 = max(0, min(y2, img_h))
+             # Ensure x1 < x2, y1 < y2 and minimum size
+             final_x1 = min(x1, x2)
+             final_y1 = min(y1, y2)
+             final_x2 = max(x1, x2)
+             final_y2 = max(y1, y2)
 
-             x1 = max(0.0, min(x1, img_w))
-             y1 = max(0.0, min(y1, img_h))
-             x2 = max(0.0, min(x2, img_w))
-             y2 = max(0.0, min(y2, img_h))
+             if (final_x2 - final_x1) < MIN_CROP_SIZE or (final_y2 - final_y1) < MIN_CROP_SIZE:
+                 return False # Update failed (minimum size violation)
 
-             sorted_x1, sorted_x2 = sorted((x1, x2))
-             sorted_y1, sorted_y2 = sorted((y1, y2))
-
-             if (sorted_x2 - sorted_x1) < MIN_CROP_SIZE or (sorted_y2 - sorted_y1) < MIN_CROP_SIZE:
-                 return False
-
-             self.crops[crop_id]['coords'] = (sorted_x1, sorted_y1, sorted_x2, sorted_y2)
-             return True
+             self.crops[crop_id]['coords'] = (final_x1, final_y1, final_x2, final_y2)
+             return True # Indicate update success
         return False
 
     def redraw_all_crops(self):
-        """Redraws all rectangles based on stored coords and current view."""
-        self.canvas.delete("crop_rect")
+        """Redraws all rectangles based on stored coords, order, and current view."""
+        all_canvas_items_ids = set(self.canvas.find_all()) # More efficient lookup
 
+        # Draw based on self.crop_order to respect Z-order if needed (though raise handles it mostly)
         for crop_id in self.crop_order:
-            if crop_id in self.crops:
-                 data = self.crops[crop_id]
-                 img_x1, img_y1, img_x2, img_y2 = data['coords']
+            if crop_id not in self.crops: continue # Should not happen if sync is correct
+            data = self.crops[crop_id]
+            img_x1, img_y1, img_x2, img_y2 = data['coords']
+            cx1, cy1 = self.image_to_canvas_coords(img_x1, img_y1)
+            cx2, cy2 = self.image_to_canvas_coords(img_x2, img_y2)
 
-                 cx1, cy1 = self.image_to_canvas_coords(img_x1, img_y1)
-                 cx2, cy2 = self.image_to_canvas_coords(img_x2, img_y2)
+            if cx1 is None: continue # Conversion failed
 
-                 if cx1 is None: continue
+            color = SELECTED_RECT_COLOR if crop_id in self.selected_crop_ids else DEFAULT_RECT_COLOR
+            tags_tuple = (RECT_TAG_PREFIX + crop_id, "crop_rect")
 
-                 color = SELECTED_RECT_COLOR if crop_id == self.selected_crop_id else DEFAULT_RECT_COLOR
-                 tags_tuple = (RECT_TAG_PREFIX + crop_id, "crop_rect")
+            rect_id = data.get('rect_id') # Use .get() for safety
 
-                 rect_id = self.canvas.create_rectangle(
-                      cx1, cy1, cx2, cy2,
-                      outline=color, width=RECT_WIDTH,
-                      tags=tags_tuple
-                 )
-                 self.crops[crop_id]['rect_id'] = rect_id
-
-        if self.selected_crop_id and self.selected_crop_id in self.crops:
-            selected_rect_id = self.crops[self.selected_crop_id]['rect_id']
-            if self.canvas.find_withtag(selected_rect_id):
-                 self.canvas.tag_raise(selected_rect_id)
-
-    def refresh_listbox(self):
-        """Clears the listbox and repopulates it based on self.crop_order."""
-        self.crop_listbox.delete(0, tk.END)
-        for crop_id in self.crop_order:
-            if crop_id in self.crops:
-                self.crop_listbox.insert(tk.END, self.crops[crop_id]['name'])
+            if rect_id and rect_id in all_canvas_items_ids:
+                 self.canvas.coords(rect_id, cx1, cy1, cx2, cy2)
+                 self.canvas.itemconfig(rect_id, outline=color, tags=tags_tuple)
             else:
-                print(f"Warning: crop_id {crop_id} found in crop_order but not in crops dictionary!")
+                 # Recreate if missing or ID was invalid
+                 new_rect_id = self.canvas.create_rectangle(
+                     cx1, cy1, cx2, cy2,
+                     outline=color, width=RECT_WIDTH,
+                     tags=tags_tuple
+                 )
+                 self.crops[crop_id]['rect_id'] = new_rect_id # Update stored ID
 
-        self.select_crop(None, from_listbox=False) # Deselect canvas selection
+        # Ensure selected are on top
+        for sel_id in self.selected_crop_ids:
+             if sel_id in self.crops and 'rect_id' in self.crops[sel_id]:
+                  rect_id_to_raise = self.crops[sel_id]['rect_id']
+                  if rect_id_to_raise in all_canvas_items_ids:
+                       self.canvas.tag_raise(rect_id_to_raise)
+
 
     def delete_selected_crops_event(self, event=None):
         """Handles delete key press."""
         self.delete_selected_crops()
 
     def delete_selected_crops(self):
-        """Deletes the currently selected crops from the listbox."""
-        selected_indices = list(self.crop_listbox.curselection())
-        if not selected_indices:
-            return
+        """Deletes all currently selected crops."""
+        indices_to_delete = self.crop_listbox.curselection()
+        if not indices_to_delete:
+            # Maybe selection comes from canvas? Use self.selected_crop_ids
+            if not self.selected_crop_ids: return # Nothing to delete
+            ids_to_delete = list(self.selected_crop_ids) # Use internal list
+        else:
+            # Get IDs from listbox indices
+            ids_to_delete = [self.get_crop_id_from_list_index(i) for i in indices_to_delete]
+            ids_to_delete = [id for id in ids_to_delete if id] # Filter out None if index was bad
 
-        crop_ids_to_delete = [self.crop_order[i] for i in selected_indices if i < len(self.crop_order)]
+        if not ids_to_delete: return
 
-        if not crop_ids_to_delete:
-             print("Warning: No valid crops found for deletion based on listbox selection.")
-             return
+        deleted_count = 0
+        for crop_id in ids_to_delete:
+            if crop_id in self.crops:
+                data = self.crops[crop_id]
 
-        if len(crop_ids_to_delete) > 1:
-            if not messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete {len(crop_ids_to_delete)} selected crops?"):
-                return
+                # Free up the number used in the default name
+                try:
+                    # Extract number from the *current* name (might have been renamed)
+                    # Find the number after the last underscore
+                    parts = data['name'].split('_')
+                    if len(parts) > 1 and parts[-1].isdigit():
+                        num = int(parts[-1])
+                        self.used_crop_numbers.discard(num) # *** Release number ***
+                except (ValueError, IndexError):
+                    print(f"Could not parse number from crop name: {data['name']}")
 
-        # Iterate in reverse order of index to avoid index issues when removing from crop_order list
-        for index in sorted(selected_indices, reverse=True):
-            if index < len(self.crop_order):
-                crop_id = self.crop_order[index]
-                if crop_id in self.crops:
-                    data = self.crops[crop_id]
-                    if self.canvas.find_withtag(data['rect_id']):
-                        self.canvas.delete(data['rect_id'])
-                    del self.crops[crop_id]
-                del self.crop_order[index]
 
-        self.refresh_listbox()
-        self.selected_crop_id = None
-        self.crop_listbox.selection_clear(0, tk.END)
-        self.btn_delete_crops.configure(state=tk.DISABLED)
+                # Remove from canvas
+                rect_id = data.get('rect_id')
+                if rect_id and rect_id in self.canvas.find_all():
+                    self.canvas.delete(rect_id)
 
-        if not self.crops:
-             self.btn_save_crops.configure(state=tk.DISABLED)
+                # Remove from internal dictionary
+                del self.crops[crop_id]
+                deleted_count += 1
+
+
+        # Remove from order list *after* iterating
+        self.crop_order = [id for id in self.crop_order if id not in ids_to_delete]
+
+        # Clear internal selection state
+        self.selected_crop_ids = []
+
+        # Rebuild the listbox entirely to reflect deletions and potentially changed order
+        self.rebuild_listbox()
+
+        print(f"Deleted {deleted_count} crop(s).")
+        self.update_button_states() # Update buttons (Save, Delete)
+
+    def rebuild_listbox(self):
+        """Clears and repopulates the listbox based on self.crop_order."""
+        self.crop_listbox.delete(0, tk.END)
+        for crop_id in self.crop_order:
+            if crop_id in self.crops:
+                self.crop_listbox.insert(tk.END, self.crops[crop_id]['name'])
+            else:
+                print(f"Warning: crop_id {crop_id} in order list but not in crops dict during rebuild.")
+        # Selection visuals will be updated by update_listbox_selection_visuals() if needed
+
+
+    def update_button_states(self):
+        """ Enable/disable buttons based on current state. """
+        has_crops = bool(self.crops)
+        has_selection = bool(self.selected_crop_ids)
+
+        self.btn_save_crops.configure(state=tk.NORMAL if has_crops else tk.DISABLED)
+        self.btn_delete_crop.configure(state=tk.NORMAL if has_selection else tk.DISABLED)
+
 
     # --- Mouse Event Handlers (Canvas) ---
     def on_mouse_press(self, event):
         self.canvas.focus_set()
         canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        self.last_click_item_id = None # Reset
 
-        if self.selected_crop_id:
-            handle = self.get_resize_handle(canvas_x, canvas_y)
-            if handle:
-                self.is_resizing = True
-                self.resize_handle = handle
-                self.start_x = canvas_x
-                self.start_y = canvas_y
-                self.start_coords_img = self.crops[self.selected_crop_id]['coords']
-                self.canvas.config(cursor=self.get_handle_cursor(handle))
-                return
+        # Check for resize handle first (only if exactly one crop is selected)
+        handle = None
+        if len(self.selected_crop_ids) == 1:
+             handle = self.get_resize_handle(canvas_x, canvas_y, self.selected_crop_ids[0])
 
-        if self.selected_crop_id:
-             rect_id = self.crops[self.selected_crop_id]['rect_id']
-             if self.canvas.find_withtag(rect_id):
-                  cx1, cy1, cx2, cy2 = self.canvas.coords(rect_id)
-                  if cx1 <= canvas_x <= cx2 and cy1 <= canvas_y <= cy2:
-                       self.is_moving = True
-                       self.start_x = canvas_x
-                       self.start_y = canvas_y
-                       self.start_coords_canvas = self.canvas.coords(rect_id)
-                       self.canvas.config(cursor="fleur")
-                       return
-
-        tolerance = 3
-        items = self.canvas.find_overlapping(canvas_x - tolerance, canvas_y - tolerance, canvas_x + tolerance, canvas_y + tolerance)
-
-        clicked_crop_id = None
-        for item_id in reversed(items):
-            tags = self.canvas.gettags(item_id)
-            for tag in tags:
-                if tag.startswith(RECT_TAG_PREFIX):
-                    crop_id = tag[len(RECT_TAG_PREFIX):]
-                    if crop_id in self.crops:
-                         cx1, cy1, cx2, cy2 = self.canvas.coords(item_id)
-                         if (cx1 <= canvas_x <= cx2 and cy1 <= canvas_y <= cy2) or \
-                            (abs(canvas_x - cx1) <= tolerance) or (abs(canvas_x - cx2) <= tolerance) or \
-                            (abs(canvas_y - cy1) <= tolerance) or (abs(canvas_y - cy2) <= tolerance) :
-                              clicked_crop_id = crop_id
-                              break
-            if clicked_crop_id:
-                 break
-
-        if clicked_crop_id:
-            self.select_crop(clicked_crop_id)
+        if handle:
+            self.is_resizing = True
+            self.resize_handle = handle
+            self.start_x = canvas_x
+            self.start_y = canvas_y
+            # Store original image coords *before* resizing starts
+            self.start_coords_img = self.crops[self.selected_crop_ids[0]]['coords']
             return
 
+        # Check if clicking inside an existing rectangle to select/move it
+        item_id = self.find_topmost_crop_rect(canvas_x, canvas_y)
+
+        if item_id:
+            tags = self.canvas.gettags(item_id)
+            clicked_crop_id = None
+            if tags and tags[0].startswith(RECT_TAG_PREFIX):
+                 clicked_crop_id = tags[0][len(RECT_TAG_PREFIX):]
+
+            if clicked_crop_id and clicked_crop_id in self.crops:
+                # If already selected, prepare for moving
+                if clicked_crop_id in self.selected_crop_ids:
+                    self.is_moving = True
+                    # Calculate offset relative to top-left corner for smooth dragging
+                    rect_coords = self.canvas.coords(item_id)
+                    self.move_offset_x = canvas_x - rect_coords[0]
+                    self.move_offset_y = canvas_y - rect_coords[1]
+                    self.last_click_item_id = item_id # Store for potential move start
+                    # Don't change selection if already selected and starting a move
+                    return
+                else:
+                    # Clicked on a different, unselected rectangle - select only this one
+                    self.select_crops([clicked_crop_id]) # Select only this one
+                    # Update listbox selection to match
+                    self.update_listbox_selection_visuals()
+                    # Allow move to start immediately after selection
+                    self.is_moving = True
+                    rect_coords = self.canvas.coords(item_id)
+                    self.move_offset_x = canvas_x - rect_coords[0]
+                    self.move_offset_y = canvas_y - rect_coords[1]
+                    self.last_click_item_id = item_id
+                    return
+
+        # If not clicking handle or existing rect, potentially start drawing
         if self.original_image:
              self.is_drawing = True
              self.start_x = canvas_x
              self.start_y = canvas_y
-             self.select_crop(None)
+             # Create temporary drawing rectangle
              self.current_rect_id = self.canvas.create_rectangle(
                  self.start_x, self.start_y, self.start_x, self.start_y,
                  outline=SELECTED_RECT_COLOR, width=RECT_WIDTH, dash=(4, 4),
                  tags=("temp_rect",)
              )
+             # Deselect any currently selected crop(s) when starting a new draw
+             if self.selected_crop_ids:
+                 self.select_crops([])
+                 self.update_listbox_selection_visuals()
 
-    def on_canvas_double_click(self, event):
-        """Handle double-click on canvas - primarily for selecting a rectangle."""
-        self.canvas.focus_set()
-        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-
-        tolerance = 3
-        items = self.canvas.find_overlapping(canvas_x - tolerance, canvas_y - tolerance, canvas_x + tolerance, canvas_y + tolerance)
-
-        clicked_crop_id = None
-        for item_id in reversed(items):
-            tags = self.canvas.gettags(item_id)
-            for tag in tags:
-                if tag.startswith(RECT_TAG_PREFIX):
-                    crop_id = tag[len(RECT_TAG_PREFIX):]
-                    if crop_id in self.crops:
-                         cx1, cy1, cx2, cy2 = self.canvas.coords(item_id)
-                         if (cx1 <= canvas_x <= cx2 and cy1 <= canvas_y <= cy2) or \
-                            (abs(canvas_x - cx1) <= tolerance) or (abs(canvas_x - cx2) <= tolerance) or \
-                            (abs(canvas_y - cy1) <= tolerance) or (abs(canvas_y - cy2) <= tolerance) :
-                              clicked_crop_id = crop_id
-                              break
-            if clicked_crop_id:
-                 break
-
-        if clicked_crop_id:
-            self.select_crop(clicked_crop_id)
 
     def on_mouse_drag(self, event):
+        # Prioritize pan over other drags if pan active
+        if self.is_panning:
+            self.on_pan_drag(event)
+            return
+
         canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
 
         if self.is_drawing and self.current_rect_id:
-            if self.canvas_image_id:
-                 img_bbox_canvas = self.canvas.bbox(self.canvas_image_id)
-                 if img_bbox_canvas:
-                      min_cx, min_cy, max_cx, max_cy = img_bbox_canvas
-                      clamped_canvas_x = max(min_cx, min(canvas_x, max_cx))
-                      clamped_canvas_y = max(min_cy, min(canvas_y, max_cy))
-                      self.canvas.coords(self.current_rect_id, self.start_x, self.start_y, clamped_canvas_x, clamped_canvas_y)
-                 else:
-                      self.canvas.coords(self.current_rect_id, self.start_x, self.start_y, canvas_x, canvas_y)
-            else:
-                 self.canvas.coords(self.current_rect_id, self.start_x, self.start_y, canvas_x, canvas_y)
+            self.canvas.coords(self.current_rect_id, self.start_x, self.start_y, canvas_x, canvas_y)
 
-        elif self.is_moving and self.selected_crop_id and self.start_coords_canvas:
-            crop_id = self.selected_crop_id
+        elif self.is_moving and len(self.selected_crop_ids) == 1: # Only move single selection for now
+            crop_id = self.selected_crop_ids[0]
+            if not crop_id in self.crops: return # Safety check
             rect_id = self.crops[crop_id]['rect_id']
+            current_canvas_coords = self.canvas.coords(rect_id)
+            w = current_canvas_coords[2] - current_canvas_coords[0]
+            h = current_canvas_coords[3] - current_canvas_coords[1]
 
-            dx = canvas_x - self.start_x
-            dy = canvas_y - self.start_y
-
-            new_cx1 = self.start_coords_canvas[0] + dx
-            new_cy1 = self.start_coords_canvas[1] + dy
-            new_cx2 = self.start_coords_canvas[2] + dx
-            new_cy2 = self.start_coords_canvas[3] + dy
+            new_cx1 = canvas_x - self.move_offset_x
+            new_cy1 = canvas_y - self.move_offset_y
+            new_cx2 = new_cx1 + w
+            new_cy2 = new_cy1 + h
 
             img_x1, img_y1 = self.canvas_to_image_coords(new_cx1, new_cy1)
             img_x2, img_y2 = self.canvas_to_image_coords(new_cx2, new_cy2)
 
             if img_x1 is not None:
-                 updated = self.update_crop_coords(crop_id, (img_x1, img_y1, img_x2, img_y2))
-                 if updated:
-                      validated_img_coords = self.crops[crop_id]['coords']
-                      cx1_final, cy1_final = self.image_to_canvas_coords(validated_img_coords[0], validated_img_coords[1])
-                      cx2_final, cy2_final = self.image_to_canvas_coords(validated_img_coords[2], validated_img_coords[3])
-                      self.canvas.coords(rect_id, cx1_final, cy1_final, cx2_final, cy2_final)
+                updated = self.update_crop_coords(crop_id, (img_x1, img_y1, img_x2, img_y2))
+                if updated:
+                     validated_img_coords = self.crops[crop_id]['coords']
+                     cx1_final, cy1_final = self.image_to_canvas_coords(validated_img_coords[0], validated_img_coords[1])
+                     cx2_final, cy2_final = self.image_to_canvas_coords(validated_img_coords[2], validated_img_coords[3])
+                     self.canvas.coords(rect_id, cx1_final, cy1_final, cx2_final, cy2_final)
 
-        elif self.is_resizing and self.selected_crop_id and self.resize_handle and self.start_coords_img:
-            crop_id = self.selected_crop_id
+        elif self.is_resizing and len(self.selected_crop_ids) == 1 and self.resize_handle:
+            crop_id = self.selected_crop_ids[0]
+            if not crop_id in self.crops: return # Safety check
             rect_id = self.crops[crop_id]['rect_id']
 
             ox1_img, oy1_img, ox2_img, oy2_img = self.start_coords_img
-
             curr_img_x, curr_img_y = self.canvas_to_image_coords(canvas_x, canvas_y)
             start_img_x, start_img_y = self.canvas_to_image_coords(self.start_x, self.start_y)
 
             if curr_img_x is None or start_img_x is None: return
 
-            dx_img = curr_img_x - start_img_x
-            dy_img = curr_img_y - start_img_y
-
+            # Use current mouse pos relative to *original* opposite corner in image coords
             nx1, ny1, nx2, ny2 = ox1_img, oy1_img, ox2_img, oy2_img
 
-            if 'n' in self.resize_handle: ny1 = oy1_img + dy_img
-            if 's' in self.resize_handle: ny2 = oy2_img + dy_img
-            if 'w' in self.resize_handle: nx1 = ox1_img + dx_img
-            if 'e' in self.resize_handle: nx2 = ox2_img + dx_img
+            # Adjust the coordinate corresponding to the handle being dragged
+            if 'n' in self.resize_handle: ny1 = curr_img_y
+            if 's' in self.resize_handle: ny2 = curr_img_y
+            if 'w' in self.resize_handle: nx1 = curr_img_x
+            if 'e' in self.resize_handle: nx2 = curr_img_x
 
             updated = self.update_crop_coords(crop_id, (nx1, ny1, nx2, ny2))
-
             if updated:
                  validated_img_coords = self.crops[crop_id]['coords']
                  cx1_final, cy1_final = self.image_to_canvas_coords(validated_img_coords[0], validated_img_coords[1])
@@ -637,67 +624,95 @@ class MultiCropApp(ctk.CTk):
 
 
     def on_mouse_release(self, event):
-        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-
         if self.is_drawing and self.current_rect_id:
-            if self.canvas.find_withtag(self.current_rect_id):
+            canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+            if self.current_rect_id in self.canvas.find_withtag("temp_rect"):
                  self.canvas.delete(self.current_rect_id)
 
-            final_rect_canvas_coords = self.canvas.coords(self.current_rect_id) if self.current_rect_id else (self.start_x, self.start_y, canvas_x, canvas_y)
-
-            img_x1, img_y1 = self.canvas_to_image_coords(final_rect_canvas_coords[0], final_rect_canvas_coords[1])
-            img_x2, img_y2 = self.canvas_to_image_coords(final_rect_canvas_coords[2], final_rect_canvas_coords[3])
+            img_x1, img_y1 = self.canvas_to_image_coords(self.start_x, self.start_y)
+            img_x2, img_y2 = self.canvas_to_image_coords(canvas_x, canvas_y)
 
             if img_x1 is not None and img_y1 is not None and img_x2 is not None and img_y2 is not None:
                  self.add_crop(img_x1, img_y1, img_x2, img_y2)
+            else:
+                 print("Failed to add crop due to coordinate conversion error.")
 
+        # Reset states
         self.is_drawing = False
         self.is_moving = False
         self.is_resizing = False
         self.resize_handle = None
         self.current_rect_id = None
-        self.start_coords_img = None
-        self.start_coords_canvas = None
+        self.last_click_item_id = None
+        self.update_cursor(event) # Reset cursor
 
-        self.update_cursor(event)
+    def on_canvas_double_click(self, event):
+        """ *** NEW: Handle double-click on canvas to select a crop. *** """
+        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        item_id = self.find_topmost_crop_rect(canvas_x, canvas_y)
+
+        if item_id:
+            tags = self.canvas.gettags(item_id)
+            clicked_crop_id = None
+            if tags and tags[0].startswith(RECT_TAG_PREFIX):
+                 clicked_crop_id = tags[0][len(RECT_TAG_PREFIX):]
+
+            if clicked_crop_id and clicked_crop_id in self.crops:
+                # Select only this crop on double click
+                self.select_crops([clicked_crop_id])
+                self.update_listbox_selection_visuals()
+                print(f"Double-clicked and selected: {self.crops[clicked_crop_id]['name']}")
+
+
+    def find_topmost_crop_rect(self, canvas_x, canvas_y):
+        """Finds the topmost item tagged 'crop_rect' under the coordinates."""
+        # Use find_overlapping which returns items in stacking order (topmost last)
+        overlapping_ids = self.canvas.find_overlapping(canvas_x - 1, canvas_y - 1, canvas_x + 1, canvas_y + 1)
+        for item_id in reversed(overlapping_ids): # Check topmost first
+            tags = self.canvas.gettags(item_id)
+            if "crop_rect" in tags:
+                return item_id
+        return None
+
 
     # --- Zoom and Pan Handlers ---
     def on_mouse_wheel(self, event, direction=None):
         if not self.original_image: return
-
-        if direction:
-            delta = direction
-        elif event.num == 5 or event.delta < 0:
-            delta = -1
-        elif event.num == 4 or event.delta > 0:
-            delta = 1
-        else:
-            return
+        # Simplified delta calculation
+        delta = 0
+        if direction: delta = direction # For Linux Button 4/5
+        elif hasattr(event, 'delta') and event.delta != 0 : delta = event.delta // abs(event.delta) # Windows/macOS
+        elif event.num == 5: delta = -1 # Linux Scroll down
+        elif event.num == 4: delta = 1  # Linux Scroll up
+        else: return
 
         zoom_increment = 1.1
-        min_zoom = 0.01
-        max_zoom = 20.0
+        min_zoom, max_zoom = 0.01, 20.0
 
-        canvas_center_x = self.canvas.canvasx(event.x)
-        canvas_center_y = self.canvas.canvasy(event.y)
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
 
-        img_x_before, img_y_before = self.canvas_to_image_coords(canvas_center_x, canvas_center_y)
+        img_x_before, img_y_before = self.canvas_to_image_coords(canvas_x, canvas_y)
         if img_x_before is None: return
 
-        new_zoom = self.zoom_factor * zoom_increment if delta > 0 else self.zoom_factor / zoom_increment
+        if delta > 0: new_zoom = self.zoom_factor * zoom_increment
+        else: new_zoom = self.zoom_factor / zoom_increment
         new_zoom = max(min_zoom, min(max_zoom, new_zoom))
 
         if new_zoom == self.zoom_factor: return
 
         self.zoom_factor = new_zoom
+        # Recalculate offset to keep point under mouse stationary
+        self.canvas_offset_x = canvas_x - (img_x_before * self.zoom_factor)
+        self.canvas_offset_y = canvas_y - (img_y_before * self.zoom_factor)
 
-        self.canvas_offset_x = canvas_center_x - (img_x_before * self.zoom_factor)
-        self.canvas_offset_y = canvas_center_y - (img_y_before * self.zoom_factor)
-
-        self.display_image_on_canvas()
+        self.display_image_on_canvas() # This also redraws crops
 
     def on_pan_press(self, event):
         if not self.original_image: return
+        # Check if drawing/resizing/moving active, if so, ignore pan
+        if self.is_drawing or self.is_resizing or self.is_moving:
+            return
         self.is_panning = True
         self.pan_start_x = self.canvas.canvasx(event.x)
         self.pan_start_y = self.canvas.canvasy(event.y)
@@ -713,305 +728,240 @@ class MultiCropApp(ctk.CTk):
         self.canvas_offset_x += dx
         self.canvas_offset_y += dy
 
+        # Move all canvas items
         self.canvas.move("all", dx, dy)
 
         self.pan_start_x = current_x
         self.pan_start_y = current_y
 
     def on_pan_release(self, event):
-        self.is_panning = False
-        self.update_cursor(event)
+        if self.is_panning:
+            self.is_panning = False
+            self.update_cursor(event)
+
 
     # --- Listbox Event Handlers ---
     def on_listbox_select(self, event=None):
         """Handles selection changes in the listbox."""
-        selection = self.crop_listbox.curselection()
+        selected_indices = self.crop_listbox.curselection()
 
-        if selection:
-             self.btn_delete_crops.configure(state=tk.NORMAL)
-        else:
-             self.btn_delete_crops.configure(state=tk.DISABLED)
+        # Get corresponding crop_ids from the indices using self.crop_order
+        selected_ids_from_list = [self.get_crop_id_from_list_index(i) for i in selected_indices]
+        selected_ids_from_list = [id for id in selected_ids_from_list if id and id in self.crops] # Filter valid IDs
 
-        if len(selection) == 1:
-            selected_index = selection[0]
-            if selected_index < len(self.crop_order):
-                 selected_crop_id = self.crop_order[selected_index]
-                 self.select_crop(selected_crop_id, from_listbox=True)
-            else:
-                 print("Warning: Listbox index out of sync with crop_order.")
-                 self.select_crop(None, from_listbox=True)
-        else:
-            self.select_crop(None, from_listbox=True)
+        # Update internal selection state ONLY IF it differs from listbox state
+        # This prevents potential infinite loops if called programmatically
+        if set(self.selected_crop_ids) != set(selected_ids_from_list):
+            self.select_crops(selected_ids_from_list)
+            # No need to call update_listbox_selection_visuals here, as this event originated from the listbox
+
+
+    def update_listbox_selection_visuals(self):
+        """ Ensures the listbox selection visually matches self.selected_crop_ids. """
+        # Block the <<ListboxSelect>> event temporarily to prevent feedback loops
+        self.crop_listbox.unbind("<<ListboxSelect>>")
+
+        self.crop_listbox.selection_clear(0, tk.END)
+        indices_to_select = []
+        for crop_id in self.selected_crop_ids:
+            index = self.get_list_index_from_crop_id(crop_id)
+            if index != -1:
+                indices_to_select.append(index)
+
+        for index in indices_to_select:
+             self.crop_listbox.selection_set(index)
+             self.crop_listbox.activate(index) # Make one active for keyboard navigation
+             self.crop_listbox.see(index)     # Ensure visible
+
+        # Re-enable the event binding
+        self.crop_listbox.bind("<<ListboxSelect>>", self.on_listbox_select)
+
 
     def on_listbox_double_click(self, event):
-        """Handles double-click on a listbox item to rename it."""
-        try:
-            selected_index = self.crop_listbox.nearest(event.y)
-            bbox = self.crop_listbox.bbox(selected_index)
-            if not bbox or not (bbox[1] <= event.y <= bbox[1] + bbox[3]):
-                return
+        """ *** NEW: Handle double-click in Listbox for renaming. *** """
+        selected_indices = self.crop_listbox.curselection()
+        if len(selected_indices) == 1: # Only allow renaming one at a time
+            index = selected_indices[0]
+            crop_id = self.get_crop_id_from_list_index(index)
+            if crop_id and crop_id in self.crops:
+                self.prompt_rename_crop(crop_id, index)
 
-            if selected_index < len(self.crop_order):
-                crop_id = self.crop_order[selected_index]
-                current_name = self.crops[crop_id]['name']
 
-                new_name = simpledialog.askstring(
-                    "Rename Crop",
-                    "Enter new name for this crop:",
-                    parent=self,
-                    initialvalue=current_name
-                )
+    def prompt_rename_crop(self, crop_id, list_index):
+        """ Shows a dialog to rename the selected crop. """
+        current_name = self.crops[crop_id]['name']
+        new_name = simpledialog.askstring("Rename Crop", f"Enter new name for '{current_name}':",
+                                          initialvalue=current_name, parent=self)
+        if new_name and new_name != current_name:
+            # Optional: Check for name conflicts if desired
+            # for other_id, data in self.crops.items():
+            #     if other_id != crop_id and data['name'] == new_name:
+            #         messagebox.showwarning("Rename Failed", f"Name '{new_name}' already exists.")
+            #         return
 
-                if new_name and new_name.strip() and new_name.strip() != current_name:
-                    self.crops[crop_id]['name'] = new_name.strip()
-                    # Update the specific item in the listbox instead of refreshing all
-                    self.crop_listbox.delete(selected_index)
-                    self.crop_listbox.insert(selected_index, self.crops[crop_id]['name'])
-                    # Restore selection after replacing the item
-                    self.crop_listbox.selection_set(selected_index)
-                    self.crop_listbox.activate(selected_index)
-                    # Note: This manual update doesn't trigger <<ListboxSelect>>.
-                    # If needed, manually call self.on_listbox_select()
+            print(f"Renaming crop {crop_id} from '{current_name}' to '{new_name}'")
+            self.crops[crop_id]['name'] = new_name
+            # Update the listbox display
+            self.crop_listbox.delete(list_index)
+            self.crop_listbox.insert(list_index, new_name)
+            # Reselect the renamed item
+            self.crop_listbox.selection_set(list_index)
+            self.on_listbox_select() # Update internal state if needed
 
-        except IndexError:
-            pass
-        except Exception as e:
-            print(f"Error during renaming: {e}")
-
-    # --- Listbox Drag and Drop ---
+    # --- Listbox Drag & Drop ---
     def on_listbox_press(self, event):
-        try:
-            pressed_index = self.crop_listbox.nearest(event.y)
-            bbox = self.crop_listbox.bbox(pressed_index)
-            if not bbox or not (bbox[1] <= event.y <= bbox[1] + bbox[3]):
-                 self.reset_listbox_drag_state()
-                 return
+        """ Record the starting index for a potential drag. """
+        # Check if click is on an actual item
+        self.drag_start_index = self.crop_listbox.nearest(event.y)
+        # Ensure the click was roughly within the item bounds horizontally too
+        x_in_widget = event.x - self.crop_listbox.winfo_rootx()
+        item_bbox = self.crop_listbox.bbox(self.drag_start_index)
+        if not item_bbox or not (item_bbox[0] <= x_in_widget <= item_bbox[0] + item_bbox[2]):
+            self.drag_start_index = None # Click was not on an item text
 
-            if pressed_index < len(self.crop_order):
-                self.drag_start_index = pressed_index
-                self.drag_item_id = self.crop_order[pressed_index]
-                self.is_dragging_listbox = False # Set true in motion
-                # self.crop_listbox.config(cursor="fleur") # Optional: change cursor
-        except IndexError:
-            self.reset_listbox_drag_state()
-            pass
 
     def on_listbox_drag(self, event):
-        if self.drag_item_id is None: return
+        """ Handle dragging motion within the listbox. """
+        if self.drag_start_index is None:
+            return # No drag initiated properly
 
-        self.is_dragging_listbox = True # Now definitely dragging
-
-        try:
-            # Get the index the mouse is currently over
-            current_index = self.crop_listbox.nearest(event.y)
-            current_index = max(0, min(current_index, self.crop_listbox.size())) # Clamp
-
-            # Visual feedback: Could potentially highlight the target row index
-            # This is hard with standard Listbox without breaking selection visuals.
-            # Skipping visual drag feedback during motion for simplicity.
-
-        except IndexError:
-            # Mouse outside listbox bounds
-            y_pos = event.y
-            listbox_height = self.crop_listbox.winfo_height()
-            if y_pos < 0: current_index = 0
-            elif y_pos > listbox_height: current_index = self.crop_listbox.size()
-            else: current_index = None # Mouse is within the listbox widget but somehow nearest failed?
-
-        if current_index is not None and self.drag_start_index is not None and current_index != self.drag_start_index:
-             # Move the item temporarily in the listbox for visual feedback
-             # This is simpler than drawing lines/ghosts
-             item_name = self.crops[self.drag_item_id]['name']
-             self.crop_listbox.delete(self.drag_start_index)
-             self.crop_listbox.insert(current_index, item_name)
-
-             # Update internal drag start index for the *next* drag event
-             # As we moved the item visually, its index is now `current_index`
-             self.drag_start_index = current_index
-
-             # Need to update selection as delete/insert clears it
-             self.crop_listbox.selection_clear(0, tk.END)
-             self.crop_listbox.selection_set(current_index)
-             self.crop_listbox.activate(current_index)
+        current_index = self.crop_listbox.nearest(event.y)
+        if current_index != self.drag_start_index:
+            # Visual cue: Change cursor or highlight insertion point (optional, more complex)
+            self.crop_listbox.config(cursor="hand2") # Indicate dragging
+            pass # Actual move happens on release
 
 
     def on_listbox_release(self, event):
-        if not self.is_dragging_listbox or self.drag_item_id is None:
-            self.reset_listbox_drag_state()
-            # If only single item selected on press, ensure it stays selected after release
-            if self.drag_start_index is not None and self.drag_start_index < self.crop_listbox.size():
-                 self.crop_listbox.selection_clear(0, tk.END)
-                 self.crop_listbox.selection_set(self.drag_start_index)
-                 self.crop_listbox.activate(self.drag_start_index)
+        """ Complete the drag and drop operation. """
+        if self.drag_start_index is None:
+            self.crop_listbox.config(cursor="") # Reset cursor if drag didn't start properly
+            # This release might also trigger a selection change if it wasn't a valid drag start
+            self.on_listbox_select()
             return
 
-        # If a drag occurred, the visual Listbox is already updated.
-        # Need to update the internal crop_order list to match the *final* visual state.
+        start_index = self.drag_start_index
+        end_index = self.crop_listbox.nearest(event.y)
+        self.drag_start_index = None # Reset drag state
+        self.crop_listbox.config(cursor="") # Reset cursor
 
-        # Find the final position of the dragged item's ID in the visually reordered listbox
-        final_index = -1
-        for i in range(self.crop_listbox.size()):
-            # Match by crop_id, looking up name from self.crops
-            item_name_in_listbox = self.crop_listbox.get(i)
-            # Find the crop_id that has this name and matches the dragged_item_id
-            found_crop_id = None
-            for cid, data in self.crops.items():
-                 if data['name'] == item_name_in_listbox and cid == self.drag_item_id:
-                      found_crop_id = cid
-                      break
-            if found_crop_id == self.drag_item_id:
-                 final_index = i
-                 break # Found the dragged item's final position
+        # Ensure the target index is valid
+        if not (0 <= end_index < self.crop_listbox.size()):
+             # Dropped outside the list bounds, treat as no-op or drop at end?
+             # Let's treat as no-op for simplicity
+             print("Drop outside list bounds, cancelling reorder.")
+             # Need to ensure selection reflects the item clicked initially if it wasn't moved
+             self.crop_listbox.selection_clear(0, tk.END)
+             self.crop_listbox.selection_set(start_index)
+             self.on_listbox_select()
+             return
 
-        if final_index != -1:
-             # Rebuild crop_order based on the final listbox state
-             new_crop_order = []
-             for i in range(self.crop_listbox.size()):
-                 item_name = self.crop_listbox.get(i)
-                 # Find the crop_id corresponding to this name.
-                 # Need to handle potential duplicate names.
-                 # A more robust approach would be to store crop_id in the listbox item itself (e.g., using data attribute, but Listbox is limited)
-                 # Or ensure names are unique, or find the *correct* ID based on original state vs dragged ID.
-                 # For simplicity, assume names are unique enough for finding the ID here.
-                 # Better approach: Use the stored self.crops dict to map names back to IDs.
-                 found_id = None
-                 for cid, data in self.crops.items():
-                      if data['name'] == item_name:
-                           # Simple check: if the dragged item's name is duplicated, this could pick the wrong one.
-                           # Need a more robust way to map listbox index back to crop_id after visual drag.
-                           # The visual drag-and-drop in Listbox is tricky because it doesn't inherently carry data (like crop_id) per row.
-                           # The simplest reliable way after a visual drag is to rebuild crop_order by looking up IDs based on names
-                           # and assuming names are unique enough for lookup after reordering.
 
-                           # More robust approach: Rebuild crop_order by iterating the *visual* listbox contents
-                           # and finding the crop_id that matches the item name *and* isn't already added to the new_crop_order
-                           is_already_added = False
-                           for existing_id in new_crop_order:
-                                if existing_id in self.crops and self.crops[existing_id]['name'] == item_name:
-                                     is_already_added = True
-                                     break
-                           if not is_already_added:
-                                found_id = cid
-                                break # Found an ID for this name not already added
+        if start_index == end_index:
+             # Clicked without dragging significantly, handle as normal selection
+             # The <<ListboxSelect>> binding should handle this naturally.
+             # We just need to ensure the cursor is reset.
+             return
 
-                 if found_id:
-                      new_crop_order.append(found_id)
-                 else:
-                      print(f"Warning: Could not find unique crop_id for name '{item_name}' during reorder rebuild.")
 
-             if len(new_crop_order) == self.crop_listbox.size(): # Only update if we successfully mapped all items
-                  self.crop_order = new_crop_order
-                  # Selection is already set by on_listbox_drag or will be set by on_listbox_select
-                  # No need to call refresh_listbox here, as the visual listbox is already updated.
-                  # Trigger selection logic manually if needed, or rely on the next user click.
-                  # self.on_listbox_select() # Can call this to ensure canvas highlights match
+        print(f"Moving item from index {start_index} to {end_index}")
 
-        self.reset_listbox_drag_state()
-        # self.crop_listbox.config(cursor="") # Optional: reset cursor
+        # Get the crop_id being moved
+        moved_crop_id = self.get_crop_id_from_list_index(start_index)
+        if not moved_crop_id:
+            print("Error: Could not find crop_id for dragged item.")
+            return
 
-    def reset_listbox_drag_state(self):
-        self.is_dragging_listbox = False
-        self.drag_start_index = None
-        self.drag_item_id = None
-        # self.crop_listbox.config(cursor="") # Ensure cursor is reset
+        # Reorder the internal self.crop_order list
+        self.crop_order.pop(start_index)
+        self.crop_order.insert(end_index, moved_crop_id)
+
+        # Rebuild the listbox to reflect the new order
+        self.rebuild_listbox()
+
+        # Restore selection to the moved item at its new position
+        new_index = self.get_list_index_from_crop_id(moved_crop_id)
+        if new_index != -1:
+             self.crop_listbox.selection_set(new_index)
+             self.on_listbox_select() # Update internal selection and button states
 
     # --- Resizing Helpers ---
-    def get_resize_handle(self, canvas_x, canvas_y):
-        """Checks if the cursor is near a resize handle of the selected crop."""
-        if not self.selected_crop_id or self.selected_crop_id not in self.crops:
+    def get_resize_handle(self, canvas_x, canvas_y, crop_id):
+        """Checks if the cursor is near a resize handle of the specified crop."""
+        if not crop_id or crop_id not in self.crops:
             return None
 
-        rect_id = self.crops[self.selected_crop_id]['rect_id']
-        if not self.canvas.find_withtag(rect_id):
+        rect_id = self.crops[crop_id].get('rect_id')
+        if not rect_id or rect_id not in self.canvas.find_all():
             return None
 
         cx1, cy1, cx2, cy2 = self.canvas.coords(rect_id)
-        margin = RESIZE_HANDLE_MARGIN
+        handle_margin = 6 # Pixels
 
-        dist_w = abs(canvas_x - cx1)
-        dist_e = abs(canvas_x - cx2)
-        dist_n = abs(canvas_y - cy1)
-        dist_s = abs(canvas_y - cy2)
+        if abs(canvas_x - cx1) < handle_margin and abs(canvas_y - cy1) < handle_margin: return 'nw'
+        if abs(canvas_x - cx2) < handle_margin and abs(canvas_y - cy1) < handle_margin: return 'ne'
+        if abs(canvas_x - cx1) < handle_margin and abs(canvas_y - cy2) < handle_margin: return 'sw'
+        if abs(canvas_x - cx2) < handle_margin and abs(canvas_y - cy2) < handle_margin: return 'se'
 
-        is_near_h_edge = (cx1 - margin) <= canvas_x <= (cx2 + margin)
-        is_near_v_edge = (cy1 - margin) <= canvas_y <= (cy2 + margin)
+        inner_buffer = handle_margin / 2
+        if abs(canvas_y - cy1) < handle_margin and (cx1 + inner_buffer) < canvas_x < (cx2 - inner_buffer): return 'n'
+        if abs(canvas_y - cy2) < handle_margin and (cx1 + inner_buffer) < canvas_x < (cx2 - inner_buffer): return 's'
+        if abs(canvas_x - cx1) < handle_margin and (cy1 + inner_buffer) < canvas_y < (cy2 - inner_buffer): return 'w'
+        if abs(canvas_x - cx2) < handle_margin and (cy1 + inner_buffer) < canvas_y < (cy2 - inner_buffer): return 'e'
 
-        handle = ''
-        if dist_n < margin and dist_w < margin: handle = 'nw'
-        elif dist_n < margin and dist_e < margin: handle = 'ne'
-        elif dist_s < margin and dist_w < margin: handle = 'sw'
-        elif dist_s < margin and dist_e < margin: handle = 'se'
-        elif dist_n < margin and is_near_h_edge: handle = 'n'
-        elif dist_s < margin and is_near_h_edge: handle = 's'
-        elif dist_w < margin and is_near_v_edge: handle = 'w'
-        elif dist_e < margin and is_near_v_edge: handle = 'e'
-
-        expanded_cx1 = cx1 - margin
-        expanded_cy1 = cy1 - margin
-        expanded_cx2 = cx2 + margin
-        expanded_cy2 = cy2 + margin
-        if not (expanded_cx1 <= canvas_x <= expanded_cx2 and expanded_cy1 <= canvas_y <= expanded_cy2):
-             return None
-
-        return handle if handle else None
-
-    def get_handle_cursor(self, handle):
-        """Maps handle names to Tk cursor names."""
-        if handle in ('nw', 'se'): return "size_nw_se"
-        elif handle in ('ne', 'sw'): return "size_ne_sw"
-        elif handle in ('n', 's'): return "size_ns"
-        elif handle in ('e', 'w'): return "size_we"
-        return ""
+        return None
 
     def update_cursor(self, event=None):
-        """Changes the mouse cursor based on position."""
-        if self.is_panning or self.is_moving or self.is_resizing or self.is_dragging_listbox:
-            return
+        if self.is_panning or self.is_moving:
+            new_cursor = "fleur"
+        elif self.is_resizing:
+            handle = self.resize_handle
+            if handle in ('nw', 'se'): new_cursor = "size_nw_se"
+            elif handle in ('ne', 'sw'): new_cursor = "size_ne_sw"
+            elif handle in ('n', 's'): new_cursor = "size_ns"
+            elif handle in ('e', 'w'): new_cursor = "size_we"
+            else: new_cursor = "" # Should not happen during resize
+        elif self.is_drawing:
+             new_cursor = "crosshair" # Indicate drawing mode
+        else:
+            new_cursor = "" # Default arrow
+            if event: # Only check hover if event provided
+                canvas_x = self.canvas.canvasx(event.x)
+                canvas_y = self.canvas.canvasy(event.y)
+                handle = None
+                hover_move = False
+                # Only check handles/move if exactly one item is selected
+                if len(self.selected_crop_ids) == 1:
+                    selected_id = self.selected_crop_ids[0]
+                    handle = self.get_resize_handle(canvas_x, canvas_y, selected_id)
+                    if not handle:
+                         # Check if inside the selected rectangle
+                         item_id = self.find_topmost_crop_rect(canvas_x, canvas_y)
+                         if item_id:
+                             tags = self.canvas.gettags(item_id)
+                             hover_crop_id = None
+                             if tags and tags[0].startswith(RECT_TAG_PREFIX):
+                                  hover_crop_id = tags[0][len(RECT_TAG_PREFIX):]
+                             if hover_crop_id == selected_id:
+                                 hover_move = True
 
-        new_cursor = ""
+                if handle:
+                    if handle in ('nw', 'se'): new_cursor = "size_nw_se"
+                    elif handle in ('ne', 'sw'): new_cursor = "size_ne_sw"
+                    elif handle in ('n', 's'): new_cursor = "size_ns"
+                    elif handle in ('e', 'w'): new_cursor = "size_we"
+                elif hover_move:
+                    new_cursor = "fleur" # Hovering over selected, movable item
 
-        if event and self.original_image:
-            canvas_x = self.canvas.canvasx(event.x)
-            canvas_y = self.canvas.canvasy(event.y)
+        if self.canvas.cget("cursor") != new_cursor:
+             self.canvas.config(cursor=new_cursor)
 
-            if self.selected_crop_id:
-                 handle = self.get_resize_handle(canvas_x, canvas_y)
-                 if handle:
-                      new_cursor = self.get_handle_cursor(handle)
-                      self.canvas.config(cursor=new_cursor)
-                      return
+    # --- Window Resize Handling ---
+    def on_window_resize(self, event=None):
+        # Maybe redraw canvas content if needed, but zoom/pan usually sufficient
+        # self.display_image_on_canvas() # Uncomment cautiously, might be slow
+        pass
 
-            if self.selected_crop_id and self.selected_crop_id in self.crops:
-                 rect_id = self.crops[self.selected_crop_id]['rect_id']
-                 if self.canvas.find_withtag(rect_id):
-                      cx1, cy1, cx2, cy2 = self.canvas.coords(rect_id)
-                      buffer = 2
-                      if (cx1 + buffer) < canvas_x < (cx2 - buffer) and (cy1 + buffer) < canvas_y < (cy2 - buffer):
-                          new_cursor = "fleur"
-                          self.canvas.config(cursor=new_cursor)
-                          return
-
-        if self.canvas.cget("cursor") != "":
-             self.canvas.config(cursor="")
-
-    # --- Window/Canvas Resize Handling ---
-    def on_canvas_configure(self, event=None):
-         """Handler for when the canvas widget changes size."""
-         if self.original_image and self.tk_image:
-             canvas_center_x = self.canvas.winfo_width() / 2
-             canvas_center_y = self.canvas.winfo_height() / 2
-             img_center_x, img_center_y = self.canvas_to_image_coords(self.canvas.canvasx(canvas_center_x), self.canvas.canvasy(canvas_center_y))
-
-             new_canvas_offset_x = self.canvas.winfo_width() / 2 - (img_center_x * self.zoom_factor) if img_center_x is not None else self.canvas_offset_x
-             new_canvas_offset_y = self.canvas.winfo_height() / 2 - (img_center_y * self.zoom_factor) if img_center_y is not None else self.canvas_offset_y
-
-             self.canvas_offset_x = new_canvas_offset_x
-             self.canvas_offset_y = new_canvas_offset_y
-
-             self.display_image_on_canvas()
-
-         elif not self.original_image and self.canvas.find_all():
-             self.canvas.delete("all")
 
     # --- Saving Crops ---
     def save_crops(self):
@@ -1023,58 +973,57 @@ class MultiCropApp(ctk.CTk):
             return
 
         base_name = os.path.splitext(os.path.basename(self.image_path))[0]
-        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-        output_dir = os.path.join(script_dir, base_name)
+        # Save in a subfolder named after the image, located where the script is run
+        output_dir_base = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
+        output_dir = os.path.join(output_dir_base, base_name) # Folder name = image base name
 
         try:
             os.makedirs(output_dir, exist_ok=True)
         except OSError as e:
-            messagebox.showerror("Directory Error", f"Could not create output directory:\n{output_dir}\n{e}")
+            messagebox.showerror("Directory Error", f"Could not create output directory:\n{output_dir}\nError: {e}")
             return
 
         saved_count = 0
         error_count = 0
 
-        # Iterate through crops using the user-defined order (self.crop_order)
-        for i, crop_id in enumerate(self.crop_order, start=1):
-            if crop_id in self.crops:
-                data = self.crops[crop_id]
-                coords = tuple(map(int, data['coords']))
-
-                filename = f"{base_name}_{i}.jpg"
-                filepath = os.path.join(output_dir, filename)
-
-                try:
-                    img_w, img_h = self.original_image.size
-                    valid_coords = (
-                        max(0, coords[0]), max(0, coords[1]),
-                        min(img_w, coords[2]), min(img_h, coords[3])
-                    )
-                    if valid_coords[2] > valid_coords[0] and valid_coords[3] > valid_coords[1]:
-                        cropped_img = self.original_image.crop(valid_coords)
-                        if cropped_img.mode in ('RGBA', 'P'):
-                            cropped_img = cropped_img.convert('RGB')
-                        cropped_img.save(filepath, "JPEG", quality=95)
-                        saved_count += 1
-                    else:
-                         error_count += 1
-                         print(f"Error saving {filename}: Invalid crop dimensions {valid_coords}")
-
-                except Exception as e:
-                    error_count += 1
-                    print(f"Error saving {filename}: {e}")
-
-            else:
-                print(f"Warning: crop_id {crop_id} found in crop_order but not in crops dictionary during save!")
+        # *** Iterate through self.crop_order to save in the user-defined sequence ***
+        for i, crop_id in enumerate(self.crop_order):
+            if crop_id not in self.crops:
+                print(f"Warning: Skipping crop ID {crop_id} as it's not in the crops dictionary.")
                 error_count += 1
+                continue
 
-        if saved_count > 0 or error_count > 0:
-            if error_count == 0:
-                messagebox.showinfo("Success", f"Successfully saved {saved_count} crops to the '{base_name}' folder.")
-            else:
-                messagebox.showwarning("Partial Success", f"Saved {saved_count} crops to '{base_name}'.\nFailed to save {error_count} crops. Check console/log for details.")
+            data = self.crops[crop_id]
+            coords = tuple(map(int, data['coords']))
+            # *** Filename uses the order index (1-based) ***
+            filename = f"{base_name}_{i + 1}.jpg"
+            filepath = os.path.join(output_dir, filename)
+
+            try:
+                cropped_img = self.original_image.crop(coords)
+                # Convert to RGB if necessary (e.g., from RGBA or P mode) before saving as JPEG
+                if cropped_img.mode == 'RGBA':
+                    # Create a white background image
+                    bg = Image.new('RGB', cropped_img.size, (255, 255, 255))
+                    # Paste the RGBA image onto the background using the alpha channel as mask
+                    bg.paste(cropped_img, (0, 0), cropped_img)
+                    cropped_img = bg
+                elif cropped_img.mode == 'P':
+                     cropped_img = cropped_img.convert('RGB')
+
+                cropped_img.save(filepath, "JPEG", quality=95) # Good default quality
+                saved_count += 1
+            except Exception as e:
+                error_count += 1
+                print(f"Error saving {filename} (Crop ID: {crop_id}): {e}")
+                # Optionally show more detailed error to user or log it
+                # messagebox.showerror("Save Error", f"Failed to save {filename}:\n{e}") # Could be annoying if many errors
+
+        # Show summary message
+        if error_count == 0:
+            messagebox.showinfo("Success", f"Successfully saved {saved_count} crops to the '{os.path.basename(output_dir)}' folder.")
         else:
-            messagebox.showinfo("No Crops Saved", "No valid crops were saved.")
+            messagebox.showwarning("Partial Success", f"Saved {saved_count} crops to '{os.path.basename(output_dir)}'.\nFailed to save {error_count} crops. Check console for details.")
 
 
 # --- Run the Application ---
